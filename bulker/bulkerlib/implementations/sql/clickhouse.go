@@ -438,6 +438,11 @@ func (ch *ClickHouse) createDatabaseIfNotExists(ctx context.Context, db string) 
 					Statement: query,
 				})
 		}
+	} else if ch.isReplicatedDatabase() {
+		var engine string
+		if err := ch.txOrDb(ctx).QueryRowContext(ctx, chDatabaseEngineQuery, db).Scan(&engine); err != nil || engine != "Replicated" {
+			return fmt.Errorf("databaseEngine=%q requires database %q to use the Replicated engine; got %q (err=%v)", DatabaseEngineReplicated, db, engine, err)
+		}
 	}
 	return nil
 }
@@ -447,13 +452,6 @@ func (ch *ClickHouse) InitDatabase(ctx context.Context) error {
 	err := ch.createDatabaseIfNotExists(ctx, ch.config.Database)
 	if err != nil {
 		return err
-	}
-	if ch.isReplicatedDatabase() {
-		var engine string
-		err := ch.txOrDb(ctx).QueryRowContext(ctx, chDatabaseEngineQuery, ch.NamespaceName(ch.config.Database)).Scan(&engine)
-		if err != nil || engine != "Replicated" {
-			return fmt.Errorf("databaseEngine=%q requires database %q to use the Replicated engine; got %q (err=%v)", DatabaseEngineReplicated, ch.config.Database, engine, err)
-		}
 	}
 	if ch.config.Cluster != "" {
 		var shardNum int
