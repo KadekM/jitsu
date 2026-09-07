@@ -137,6 +137,7 @@ func (ps *AbstractSQLStream) preprocess(object types.Object, skipTypeHints bool)
 		if err != nil {
 			return nil, nil, err
 		}
+		sqlTypesHints = filterSQLTypesHints(ps.sqlAdapter.Type(), sqlTypesHints)
 	}
 	if len(ps.customTypes) > 0 {
 		if sqlTypesHints == nil {
