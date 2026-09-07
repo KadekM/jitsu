@@ -23,7 +23,9 @@ Send a JSON object to Bulker, and it will make sure the object is saved to the d
 - **JSON flattening.** Your object is flattened — `{a: {b: 1}}` becomes `{a_b: 1}`.
 - **Schema management for semi-structured data.** For each field, Bulker makes sure a corresponding
   column exists in the destination table, and creates it if not. The type is best-guessed from the
-  value, or set explicitly with a type hint: `{"a": "test", "__sql_type_a": "varchar(4)"}`.
+  value, or set explicitly with a type hint: `{"a": "test", "__sql_type_a": "varchar(4)"}`. Type
+  hints must match the destination driver's supported type allowlist; SQL clauses and expressions
+  are ignored.
 - **Reliability.** The object goes to a Kafka queue immediately, so if the warehouse is down, data
   isn't lost.
 - **Streaming or batching.** Data goes to the warehouse either as soon as it's available in Kafka
