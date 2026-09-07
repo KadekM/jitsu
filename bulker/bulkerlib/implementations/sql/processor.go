@@ -1,7 +1,6 @@
 package sql
 
 import (
-	"fmt"
 	"github.com/jitsucom/bulker/bulkerlib/implementations"
 	"github.com/jitsucom/bulker/bulkerlib/types"
 	types2 "github.com/jitsucom/bulker/jitsubase/types"
@@ -22,6 +21,7 @@ func ProcessEvents(tableName string, event types.Object, customTypes types.SQLTy
 		if err != nil {
 			return nil, nil, err
 		}
+		sqlTypesHints = filterSQLTypesHintsForAnyDriver(sqlTypesHints)
 	}
 	if len(customTypes) > 0 {
 		if sqlTypesHints == nil {
@@ -71,17 +71,8 @@ func _extractSQLTypesHints(key string, object types.Object, result types.SQLType
 			//when columnName is empty it means that provided sql type is meant for the whole object
 			//e.g. to map nested object to sql JSON type you can add the following property to nested object: "__sql_type_": "JSON" )
 			mappedColumnName := utils.JoinNonEmptyStrings("_", key, columnName)
-			switch val := v.(type) {
-			case []any:
-				if len(val) > 1 {
-					result[mappedColumnName] = types.SQLColumn{Type: fmt.Sprint(val[0]), DdlType: fmt.Sprint(val[1]), Override: true}
-				} else {
-					result[mappedColumnName] = types.SQLColumn{Type: fmt.Sprint(val[0]), Override: true}
-				}
-			case string:
-				result[mappedColumnName] = types.SQLColumn{Type: val, Override: true}
-			default:
-				return fmt.Errorf("incorrect type of value for '__sql_type_' hint: %T", v)
+			if hint, ok := parseSQLTypeHint(v); ok {
+				result[mappedColumnName] = hint
 			}
 		} else if val, ok := v.(types.Object); ok {
 			err := _extractSQLTypesHints(utils.JoinNonEmptyStrings("_", key, k), val, result)
@@ -92,6 +83,44 @@ func _extractSQLTypesHints(key string, object types.Object, result types.SQLType
 	}
 
 	return nil
+}
+
+func parseSQLTypeHint(value any) (types.SQLColumn, bool) {
+	switch value := value.(type) {
+	case string:
+		if value == "" {
+			return types.SQLColumn{}, false
+		}
+		return types.SQLColumn{Type: value, Override: true}, true
+	case []any:
+		values := make([]string, len(value))
+		for i, item := range value {
+			stringValue, ok := item.(string)
+			if !ok {
+				return types.SQLColumn{}, false
+			}
+			values[i] = stringValue
+		}
+		return parseSQLTypeHintArray(values)
+	case []string:
+		return parseSQLTypeHintArray(value)
+	default:
+		return types.SQLColumn{}, false
+	}
+}
+
+func parseSQLTypeHintArray(value []string) (types.SQLColumn, bool) {
+	if len(value) < 1 || len(value) > 2 || value[0] == "" {
+		return types.SQLColumn{}, false
+	}
+	hint := types.SQLColumn{Type: value[0], Override: true}
+	if len(value) == 2 {
+		if value[1] == "" {
+			return types.SQLColumn{}, false
+		}
+		hint.DdlType = value[1]
+	}
+	return hint, true
 }
 
 //
