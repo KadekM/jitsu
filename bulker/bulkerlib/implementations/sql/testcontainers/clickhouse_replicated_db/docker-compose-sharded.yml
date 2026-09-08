@@ -6,7 +6,7 @@ x-clickhouse: &clickhouse
   volumes:
     - ./config.xml:/etc/clickhouse-server/config.xml:ro
     - ./users.xml:/etc/clickhouse-server/users.xml:ro
-    - ./cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+    - ./cluster-sharded.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
   healthcheck:
     test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
     interval: 1s
@@ -40,3 +40,19 @@ services:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
       CLICKHOUSE_SHARD: "01"
       CLICKHOUSE_REPLICA: clickhouse_repl02
+  clickhouse_repl03:
+    <<: *clickhouse
+    hostname: clickhouse_repl03
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      CLICKHOUSE_SHARD: "02"
+      CLICKHOUSE_REPLICA: clickhouse_repl03
+  clickhouse_repl04:
+    <<: *clickhouse
+    hostname: clickhouse_repl04
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      CLICKHOUSE_SHARD: "02"
+      CLICKHOUSE_REPLICA: clickhouse_repl04

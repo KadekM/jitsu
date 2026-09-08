@@ -30,7 +30,7 @@ var constantTime2 = timestamp.MustParseTime(time.RFC3339Nano, "2022-08-18T15:17:
 const forceLeaveResultingTables = false
 
 var allBulkerConfigs = []string{BigqueryBulkerTypeId, RedshiftBulkerTypeId, RedshiftBulkerTypeId + "_iam", RedshiftBulkerTypeId + "_serverless", SnowflakeBulkerTypeId, PostgresBulkerTypeId,
-	MySQLBulkerTypeId, ClickHouseBulkerTypeId, ClickHouseBulkerTypeId + "_cluster", ClickHouseBulkerTypeId + "_cluster_noshards", ClickHouseBulkerTypeId + "_replicated_db", DuckDBBulkerTypeId}
+	MySQLBulkerTypeId, ClickHouseBulkerTypeId, ClickHouseBulkerTypeId + "_cluster", ClickHouseBulkerTypeId + "_cluster_noshards", ClickHouseBulkerTypeId + "_replicated_db", ClickHouseBulkerTypeId + "_replicated_db_sharded", DuckDBBulkerTypeId}
 
 var exceptBigquery []string
 
@@ -58,6 +58,20 @@ var clickhouseContainer *testcontainers2.ClickHouseContainer
 var clickhouseClusterContainer *clickhouse.ClickHouseClusterContainer
 var clickhouseClusterContainerNoShards *clickhouse_noshards.ClickHouseClusterContainerNoShards
 var clickhouseReplicatedDBContainer *clickhouse_replicated_db.ClickHouseReplicatedDBContainer
+var clickhouseReplicatedDBShardedContainer *clickhouse_replicated_db.ClickHouseReplicatedDBContainer
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	for _, container := range []*clickhouse_replicated_db.ClickHouseReplicatedDBContainer{clickhouseReplicatedDBContainer, clickhouseReplicatedDBShardedContainer} {
+		if container != nil {
+			if err := container.Close(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				code = 1
+			}
+		}
+	}
+	os.Exit(code)
+}
 
 func init() {
 	// uncomment to run tests locally with just one bulker type
@@ -217,6 +231,19 @@ func init() {
 			Username:       "default",
 			Database:       clickhouseReplicatedDBContainer.Database,
 			Cluster:        clickhouseReplicatedDBContainer.Cluster,
+			DatabaseEngine: DatabaseEngineReplicated,
+		}}
+	}
+	if utils.ArrayContains(allBulkerConfigs, ClickHouseBulkerTypeId+"_replicated_db_sharded") {
+		clickhouseReplicatedDBShardedContainer, err = clickhouse_replicated_db.NewClickhouseReplicatedDBShardedContainer(context.Background())
+		if err != nil {
+			panic(err)
+		}
+		configRegistry[ClickHouseBulkerTypeId+"_replicated_db_sharded"] = TestConfig{BulkerType: ClickHouseBulkerTypeId, Config: ClickHouseConfig{
+			Hosts:          clickhouseReplicatedDBShardedContainer.Hosts,
+			Username:       "default",
+			Database:       clickhouseReplicatedDBShardedContainer.Database,
+			Cluster:        clickhouseReplicatedDBShardedContainer.Cluster,
 			DatabaseEngine: DatabaseEngineReplicated,
 		}}
 	}

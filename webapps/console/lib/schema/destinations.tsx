@@ -307,7 +307,7 @@ export const ClickhouseCredentials = z.object({
     .enum(["default", "replicated"])
     .optional()
     .describe(
-      "Database engine::ClickHouse database engine used by the destination database. <code>default</code> covers <code>Atomic</code> (self-hosted) and <code>Shared</code> (ClickHouse Cloud); Jitsu creates tables as <code>ReplicatedMergeTree</code> with explicit ZooKeeper paths and <code>ON CLUSTER</code>. Choose <code>replicated</code> when the destination database itself uses the <a href='https://clickhouse.com/docs/en/engines/database-engines/replicated' rel='noreferrer noopener' target='_blank'>Replicated</a> engine — Jitsu then emits path-less <code>ReplicatedMergeTree</code> and skips <code>ON CLUSTER</code> on DDL inside the database (the engine replicates DDL itself). Ignored when <b>cluster</b> is empty."
+      "Database engine::Use <code>default</code> for Atomic or ClickHouse Cloud databases. Choose <code>replicated</code> for the <a href='https://clickhouse.com/docs/en/engines/database-engines/replicated' rel='noreferrer noopener' target='_blank'>Replicated</a> database engine. This requires a <b>cluster</b> name, even when connecting through one host. Tables use ReplicatedMergeTree engines without explicit Keeper paths, and the database handles DDL replication."
     ),
   database: z.string().default("default").describe("Name of the database to use"),
   parameters: z
@@ -550,7 +550,7 @@ export const coreDestinations: DestinationType<any>[] = [
         hidden: true,
       },
       databaseEngine: {
-        hidden: obj => !obj.cluster,
+        hidden: obj => !obj.cluster && obj.databaseEngine !== "replicated",
       },
       password: {
         password: true,

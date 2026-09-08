@@ -3,13 +3,10 @@ package clickhouse_replicated_db
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strings"
-	"time"
+	"net"
+	"os"
 
-	"github.com/jitsucom/bulker/jitsubase/logging"
+	"github.com/jitsucom/bulker/jitsubase/uuid"
 	"github.com/testcontainers/testcontainers-go"
 	tc "github.com/testcontainers/testcontainers-go/modules/compose"
 )
@@ -19,14 +16,7 @@ const (
 	chCluster  = "replicated_cluster"
 )
 
-var (
-	chHostsHTTP   = []string{"localhost:8223", "localhost:8224"}
-	chHostsNative = []string{"localhost:9100", "localhost:9101"}
-)
-
-// ClickHouseReplicatedDBContainer is a ClickHouse cluster + ZooKeeper testcontainer intended for
-// exercising Jitsu's `databaseEngine=replicated` code path. Topology: 1 shard × 2 replicas — enough
-// to exercise Replicated-database DDL propagation without straining shared CI resources.
+// ClickHouseReplicatedDBContainer runs one or two shards with two replicas each.
 type ClickHouseReplicatedDBContainer struct {
 	Identifier string
 	Container  testcontainers.Container
@@ -39,36 +29,59 @@ type ClickHouseReplicatedDBContainer struct {
 	Database  string
 }
 
-// NewClickhouseReplicatedDBContainer brings up the cluster compose and pre-creates the destination
-// database with ENGINE = Replicated so the bulker test suite can connect against it.
+// NewClickhouseReplicatedDBContainer starts a cluster for replicated database tests.
 func NewClickhouseReplicatedDBContainer(ctx context.Context) (*ClickHouseReplicatedDBContainer, error) {
-	composeFilePaths := "testcontainers/clickhouse_replicated_db/docker-compose.yml"
-	identifier := "bulker_clickhouse_replicated_db_compose"
+	return newClickhouseReplicatedDBContainer(ctx, false)
+}
 
+func NewClickhouseReplicatedDBShardedContainer(ctx context.Context) (*ClickHouseReplicatedDBContainer, error) {
+	return newClickhouseReplicatedDBContainer(ctx, true)
+}
+
+func newClickhouseReplicatedDBContainer(ctx context.Context, sharded bool) (*ClickHouseReplicatedDBContainer, error) {
+	composeFilePaths := "testcontainers/clickhouse_replicated_db/docker-compose.yml"
+	services := []string{"clickhouse_repl01", "clickhouse_repl02"}
+	if sharded {
+		composeFilePaths = "testcontainers/clickhouse_replicated_db/docker-compose-sharded.yml"
+		services = append(services, "clickhouse_repl03", "clickhouse_repl04")
+	}
+	identifier := "bulker_replicated_" + uuid.NewLettersNumbers()
 	compose, err := tc.NewDockerComposeWith(tc.WithStackFiles(composeFilePaths), tc.StackIdentifier(identifier))
 	if err != nil {
-		logging.Errorf("couldnt down docker compose: %s : %v", identifier, err)
+		return nil, fmt.Errorf("could not configure compose: %w", err)
 	}
-	err = compose.Down(ctx)
-	if err != nil {
-		logging.Errorf("couldnt down docker compose: %s : %v", identifier, err)
-	}
-
-	compose, err = tc.NewDockerComposeWith(tc.WithStackFiles(composeFilePaths), tc.StackIdentifier(identifier))
-	if err != nil {
-		return nil, fmt.Errorf("could not run compose file: %v - %v", composeFilePaths, err)
+	if image := os.Getenv("CLICKHOUSE_TEST_IMAGE"); image != "" {
+		compose.WithEnv(map[string]string{"CLICKHOUSE_TEST_IMAGE": image})
 	}
 	err = compose.Up(ctx, tc.Wait(true))
 	if err != nil {
+		_ = compose.Down(ctx)
 		return nil, fmt.Errorf("could not run compose file: %v - %v", composeFilePaths, err)
 	}
-	// Pre-create the destination Replicated database. The ClickHouse Go driver opens its connection
-	// against config.Database, which must exist before NewClickHouse can ping. In production users
-	// pre-create their Replicated DB; here we mirror that one-time setup so the rest of the bulker
-	// test suite (which exercises tables, namespaces, schema changes) starts from the same state.
-	if err := createReplicatedDatabase(chHostsHTTP[0], chDatabase, chCluster); err != nil {
-		_ = compose.Down(ctx)
-		return nil, fmt.Errorf("could not create replicated database: %v", err)
+	var chHostsHTTP, chHostsNative []string
+	for _, service := range services {
+		container, err := compose.ServiceContainer(ctx, service)
+		if err != nil {
+			_ = compose.Down(ctx)
+			return nil, err
+		}
+		host, err := container.Host(ctx)
+		if err != nil {
+			_ = compose.Down(ctx)
+			return nil, err
+		}
+		httpPort, err := container.MappedPort(ctx, "8123/tcp")
+		if err != nil {
+			_ = compose.Down(ctx)
+			return nil, err
+		}
+		nativePort, err := container.MappedPort(ctx, "9000/tcp")
+		if err != nil {
+			_ = compose.Down(ctx)
+			return nil, err
+		}
+		chHostsHTTP = append(chHostsHTTP, net.JoinHostPort(host, httpPort.Port()))
+		chHostsNative = append(chHostsNative, net.JoinHostPort(host, nativePort.Port()))
 	}
 	return &ClickHouseReplicatedDBContainer{
 		Identifier: identifier,
@@ -81,42 +94,12 @@ func NewClickhouseReplicatedDBContainer(ctx context.Context) (*ClickHouseReplica
 	}, nil
 }
 
-// createReplicatedDatabase issues `CREATE DATABASE IF NOT EXISTS <db> ON CLUSTER <cluster>
-// ENGINE = Replicated(...)` against the first node, retrying briefly while the cluster settles.
-func createReplicatedDatabase(httpAddr, db, cluster string) error {
-	stmt := fmt.Sprintf(
-		"CREATE DATABASE IF NOT EXISTS %s ON CLUSTER %s ENGINE = Replicated('/clickhouse/databases/%s', '{shard}', '{replica}')",
-		db, cluster, db,
-	)
-	endpoint := "http://" + httpAddr + "/?" + url.Values{"query": []string{stmt}}.Encode()
-
-	var lastErr error
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Post(endpoint, "text/plain", strings.NewReader(""))
-		if err != nil {
-			lastErr = err
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			return nil
-		}
-		lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		time.Sleep(2 * time.Second)
-	}
-	return lastErr
-}
-
 // Close terminates the underlying compose stack.
 func (ch *ClickHouseReplicatedDBContainer) Close() error {
 	if ch.Compose != nil {
-		execError := ch.Compose.Down(context.Background())
-		err := execError.Error
+		err := ch.Compose.Down(context.Background())
 		if err != nil {
-			return fmt.Errorf("could down docker compose: %s", ch.Identifier)
+			return fmt.Errorf("could not stop compose stack %s: %w", ch.Identifier, err)
 		}
 	}
 	return nil
