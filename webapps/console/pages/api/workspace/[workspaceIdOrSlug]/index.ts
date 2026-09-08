@@ -15,7 +15,7 @@ import { randomUUID } from "crypto";
 import { validateSlug, validateWorkspaceName } from "../validate";
 import { workspaceAuditLog } from "../../../../lib/server/audit-log";
 
-const log = getServerLog();
+const log = getServerLog("api/workspace");
 
 async function savePreferences(user: SessionUser, workspace): Promise<void> {
   await Promise.all([
@@ -115,24 +115,17 @@ export const route = createRoute()
     try {
       await verifyAccess(user, workspace.id);
     } catch (e) {
-      throw new ApiError(
-        `Current user doesn't have an access to workspace`,
-        {
+      throw new ApiError(`Current user doesn't have an access to workspace`, {
+        status: 403,
+        responseObject: {
           noAccessToWorkspace: true,
         },
-        { status: 403 }
-      );
+      });
     }
     if (workspace.slug) {
-      withProductAnalytics(
-        callback =>
-          callback.track("workspace_access", {
-            workspaceId: workspace.id,
-            workspaceName: workspace.name,
-            workspaceSlug: workspace.slug,
-          }),
-        { user, workspace, req }
-      );
+      // workspaceId/workspaceName/workspaceSlug are injected for every event by
+      // withProductAnalytics, so we only need to name the event here.
+      withProductAnalytics(callback => callback.track("workspace_access"), { user, workspace, req });
     }
 
     try {
@@ -154,7 +147,14 @@ export const route = createRoute()
     auth: true,
     summary: "Update workspace",
     tags: ["workspace"],
-    body: z.object({ name: z.string(), slug: z.string() }),
+    body: z.object({
+      name: z.string(),
+      slug: z.string(),
+      // Deliberately a dedicated boolean rather than raw `featuresEnabled`: that array
+      // also carries admin-managed flags (throttle=, shard=, nobackup, ...) that
+      // workspace members must not be able to set.
+      captureHeaders: z.boolean().optional(),
+    }),
     query: z.object({
       workspaceIdOrSlug: z.string(),
     }),
@@ -175,18 +175,38 @@ export const route = createRoute()
     }
 
     const prev = await db.prisma().workspace.findUnique({ where: { id: workspaceIdOrSlug } });
+    let featuresEnabled: string[] | undefined = undefined;
+    if (body.captureHeaders !== undefined && prev) {
+      const withoutFlag = (prev.featuresEnabled ?? []).filter(f => f !== "captureHeaders");
+      featuresEnabled = body.captureHeaders ? [...withoutFlag, "captureHeaders"] : withoutFlag;
+    }
     const workspace = await db.prisma().workspace.update({
       where: { id: workspaceIdOrSlug },
-      data: { name: body.name.trim(), slug: body.slug.trim() },
+      data: {
+        name: body.name.trim(),
+        slug: body.slug.trim(),
+        ...(featuresEnabled !== undefined ? { featuresEnabled } : {}),
+      },
     });
     // Skip the audit row when nothing observable changed (no-op save) so owners
     // aren't spammed with empty workspace-updated entries. (PR #1288)
-    if (prev && (prev.name !== workspace.name || prev.slug !== workspace.slug)) {
-      await workspaceAuditLog(user, workspace.id, "updated", {
-        prevVersion: { name: prev.name, slug: prev.slug },
-        newVersion: { name: workspace.name, slug: workspace.slug },
-        workspaceName: workspace.name,
-      });
+    if (
+      prev &&
+      (prev.name !== workspace.name ||
+        prev.slug !== workspace.slug ||
+        !isEqual(prev.featuresEnabled, workspace.featuresEnabled))
+    ) {
+      await workspaceAuditLog(
+        user,
+        workspace.id,
+        "updated",
+        {
+          prevVersion: { name: prev.name, slug: prev.slug, featuresEnabled: prev.featuresEnabled },
+          newVersion: { name: workspace.name, slug: workspace.slug, featuresEnabled: workspace.featuresEnabled },
+          workspaceName: workspace.name,
+        },
+        req
+      );
     }
     if (onboarding === "true") {
       await withProductAnalytics(callback => callback.track("workspace_onboarded"), { user, workspace, req });

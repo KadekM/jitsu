@@ -24,6 +24,7 @@ func (r *Router) FuncsHandler(c *gin.Context) {
 	var rError *appbase.RouterError
 	var body []byte
 	var ingestMessageBytes []byte
+	var ingestMessage *IngestMessage
 	ingestType := IngestTypeS2S
 	var messageId string
 
@@ -39,13 +40,13 @@ func (r *Router) FuncsHandler(c *gin.Context) {
 			IngestedMessagesReceived(metricsId, "errors").Inc()
 			obj := map[string]any{"body": string(ingestMessageBytes), "error": rError.PublicError.Error(), "status": utils.Ternary(rError.ErrorType == ErrThrottledType, "SKIPPED", "FAILED")}
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{EventType: eventslog.EventTypeIncoming, Level: eventslog.LevelError, ActorId: metricsId, Event: obj})
-			IngestHandlerRequests(domain, utils.Ternary(rError.ErrorType == ErrThrottledType, "throttled", "error"), rError.ErrorType).Inc()
+			IngestHandlerRequests(metricsId, utils.Ternary(rError.ErrorType == ErrThrottledType, "throttled", "error"), rError.ErrorType).Inc()
 			_ = r.producer.ProduceAsync(r.config.KafkaDestinationsDeadLetterTopicName, uuid.New(), utils.TruncateBytes(ingestMessageBytes, r.config.MaxIngestPayloadSize), map[string]string{"error": rError.Error.Error()}, kafka2.PartitionAny, messageId, false, 0)
 		} else {
 			obj := map[string]any{"body": string(ingestMessageBytes)}
 			obj["status"] = "SUCCESS"
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{EventType: eventslog.EventTypeIncoming, Level: eventslog.LevelInfo, ActorId: metricsId, Event: obj})
-			IngestHandlerRequests(domain, "success", "").Inc()
+			IngestHandlerRequests(metricsId, "success", "").Inc()
 		}
 	}()
 	defer func() {
@@ -111,7 +112,7 @@ func (r *Router) FuncsHandler(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 		return
 	}
-	_, ingestMessageBytes, err = r.buildIngestMessage(c, messageId, message, nil, tp, loc, stream, patchEvent, "")
+	ingestMessage, ingestMessageBytes, err = r.buildIngestMessage(c, messageId, message, nil, tp, loc, stream, patchEvent, "")
 	if err != nil {
 		rError = r.ResponseError(c, utils.Ternary(s2sEndpoint, http.StatusBadRequest, http.StatusOK), "event error", false, err, true, true, false)
 		return
@@ -128,7 +129,7 @@ func (r *Router) FuncsHandler(c *gin.Context) {
 	}
 	fsURL := strings.Replace(r.config.FunctionsServerURLTemplate, "${workspaceId}", deploymentID, 1)
 	endpointURL := fsURL + "/multi"
-	result, err := r.callFunctionsEndpoint(stream, []*ShortDestinationConfig{connection}, endpointURL, ingestMessageBytes, functionsResults, true)
+	result, err := r.callFunctionsEndpoint(stream, []*ShortDestinationConfig{connection}, endpointURL, ingestMessageBytes, functionsResults, true, messageId, parseReceivedAt(ingestMessage.MessageCreated))
 	if err != nil {
 		if strings.Contains(err.Error(), "timeout") {
 			IngestedMessages(connection.ConnectionId, "error", "timeout").Inc()

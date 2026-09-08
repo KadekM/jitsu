@@ -1,37 +1,46 @@
+import { ReactNode } from "react";
 import { SomeZodObject, z } from "zod";
-import React, { ReactNode } from "react";
 
 import amplitudeIcon from "./icons/amplitude";
 import bigqueryIcon from "./icons/bigquery";
+import blazeIcon from "./icons/blaze";
 import ClickhouseIcon from "./icons/clickhouse";
 import devnullIcon from "./icons/devnull";
+import facebookIcon from "./icons/facebook";
+import googleAdsIcon from "./icons/google-ads";
 import gcsIcon from "./icons/gcs";
 import hubspotIcon from "./icons/hubspot";
-import mixpanelIcon from "./icons/mixpanel";
-import facebookIcon from "./icons/facebook";
 import juneIcon from "./icons/june";
-import blazeIcon from "./icons/blaze";
-import salesforceIcon from "./icons/salesforce";
+import mixpanelIcon from "./icons/mixpanel";
 import mongodbIcon from "./icons/mongodb";
+import resendIcon from "./icons/resend";
+import salesforceIcon from "./icons/salesforce";
+import sendgridIcon from "./icons/sendgrid";
 import statsigIcon from "./icons/statsig";
 
-import ga4Icon from "./icons/ga4";
-import gtmIcon from "./icons/gtm";
-import postgresIcon from "./icons/postgres";
-import mysqlIcon from "./icons/mysql";
-import motherduckIcon from "./icons/motherduck";
-import redshiftIcon from "./icons/redshift";
-import posthogIcon from "./icons/posthog";
-import segmentIcon from "./icons/segment";
-import s3Icon from "./icons/s3";
-import tagIcon from "./icons/tag";
-import snowflakeIcon from "./icons/snowflake";
-import logRocketIcon from "./icons/logrocket";
-import intercomIcon from "./icons/intercom";
-import webhookIcon from "./icons/webhook";
-import { branding } from "../branding";
 import * as meta from "@jitsu/destination-functions/src/meta";
 import { HubspotCredentials } from "@jitsu/destination-functions/src/meta";
+import { branding } from "../branding";
+import { ValidationMessages } from "./config-editor-errors";
+import { ClientFieldValidator } from "./config-editor-validation";
+import clarityIcon from "./icons/clarity";
+import ga4Icon from "./icons/ga4";
+import gtmIcon from "./icons/gtm";
+import hotjarIcon from "./icons/hotjar";
+import intercomIcon from "./icons/intercom";
+import logRocketIcon from "./icons/logrocket";
+import motherduckIcon from "./icons/motherduck";
+import mysqlIcon from "./icons/mysql";
+import postgresIcon from "./icons/postgres";
+import posthogIcon from "./icons/posthog";
+import redshiftIcon from "./icons/redshift";
+import s3Icon from "./icons/s3";
+import segmentIcon from "./icons/segment";
+import snowflakeIcon from "./icons/snowflake";
+import tagIcon from "./icons/tag";
+import webhookIcon from "./icons/webhook";
+import { validatePosthogHost } from "./posthog-host-validation";
+import { validateWebhookUrl } from "./webhook-url-validation";
 
 const s3Regions = [
   "us-west-1",
@@ -78,6 +87,10 @@ export type PropertyUI = {
    */
   password?: boolean;
   /**
+   * Placeholder shown in the input when the field is empty
+   */
+  placeholder?: string;
+  /**
    * If the field should not be displayed. That field must have a default value
    */
   hidden?: boolean | ((obj: any) => boolean);
@@ -102,6 +115,14 @@ export type PropertyUI = {
    * Properties of an editor component (not implemented yet, reserved for the future)
    */
   editorProps?: any;
+  /**
+   * User-facing replacements for validation errors, keyed by the AJV keyword.
+   */
+  validationMessages?: ValidationMessages;
+  /**
+   * Client-side validation that returns a user-facing error message.
+   */
+  clientValidator?: ClientFieldValidator;
 };
 
 export type SchemaUI = Record<string, PropertyUI>;
@@ -126,13 +147,15 @@ export type CloudDestinationsConnectionOptions = z.infer<typeof CloudDestination
 //Auxiliary type for batch mode options
 export const BatchModeOptions = z.object({
   batchSize: z.number().min(1).default(10000),
+  // .nullish() must come before .default(): the other way around the optional
+  // wrapper short-circuits an absent value and the default never applies
   frequency: z
     .number()
     .int()
     .min(1)
     .max(60 * 24)
-    .default(5)
-    .nullish(),
+    .nullish()
+    .default(60),
 });
 export type BatchModeOptions = z.infer<typeof BatchModeOptions>;
 
@@ -254,8 +277,12 @@ export function getCoreDestinationType(typeId: string): DestinationType {
   return destinationType;
 }
 
-export function getCoreDestinationTypeNonStrict(typeId: string): DestinationType | undefined {
-  return coreDestinationsMap[typeId];
+export function getCoreDestinationTypeNonStrict(typeId: string | undefined): DestinationType | undefined {
+  // Own-key lookup — see getConfigObjectTypeNonStrict: prototype-inherited names
+  // like "toString" must not resolve to a destination type.
+  return typeId && Object.prototype.hasOwnProperty.call(coreDestinationsMap, typeId)
+    ? coreDestinationsMap[typeId]
+    : undefined;
 }
 
 export const ClickhouseCredentials = z.object({
@@ -315,6 +342,86 @@ const logRocketDestination = {
   deviceOptions: {
     type: "internal-plugin",
     name: "logrocket",
+  } as DeviceOptions,
+  connectionOptions: DeviceDestinationsConnectionOptions,
+};
+
+const clarityDestination = {
+  id: "clarity",
+  isSynchronous: true,
+  icon: clarityIcon,
+  title: "Microsoft Clarity",
+  tags: "Device Destinations",
+  description:
+    "Microsoft Clarity is a free heatmap and session-recording tool. Jitsu attaches user identity, tags and custom events to Clarity sessions with a client-side snippet.",
+  credentials: z.object({
+    projectId: z
+      .string()
+      .describe(
+        "Project ID::Your Clarity Project ID. Open your Clarity project » Settings » Overview to find it. It also serves as the API key. Only used when Jitsu loads the Clarity tag."
+      ),
+    loadClarity: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Load Clarity::Whether Jitsu should load the Microsoft Clarity tag. Disable this if you already load Clarity yourself (e.g. via your own snippet or a tag manager) — Jitsu will only forward events to the existing Clarity instance and the Project ID is ignored."
+      ),
+    cookieConsent: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Cookie consent::Call <code>clarity('consent')</code> after the tag loads. Enable this if you rely on Clarity's cookie consent gate."
+      ),
+    trackProperties: z
+      .enum(["tags", "ignore"])
+      .default("tags")
+      .describe(
+        "Track event properties::Clarity custom events carry only a name. Choose <code>tags</code> to also forward <code>track</code> properties as filterable Clarity custom tags, or <code>ignore</code> to send the event name only."
+      ),
+  }),
+  deviceOptions: {
+    type: "internal-plugin",
+    name: "clarity",
+  } as DeviceOptions,
+  connectionOptions: DeviceDestinationsConnectionOptions,
+};
+
+const hotjarDestination = {
+  id: "hotjar",
+  isSynchronous: true,
+  icon: hotjarIcon,
+  title: "Hotjar",
+  tags: "Device Destinations",
+  description:
+    "Hotjar is a heatmap, session-recording and survey tool. Jitsu attaches user attributes and custom events to Hotjar with a client-side snippet.",
+  credentials: z.object({
+    siteId: z
+      .string()
+      .describe(
+        "Site ID::Your Hotjar Site ID (the numeric <code>hjid</code>). Find it in Hotjar » Settings » Sites & Organizations, or in your tracking-code snippet. Only used when Jitsu loads the Hotjar tag."
+      ),
+    loadHotjar: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Load Hotjar::Whether Jitsu should load the Hotjar tag. Disable this if you already load Hotjar yourself (e.g. via your own snippet or a tag manager) — Jitsu will only forward events to the existing Hotjar instance and the Site ID is ignored."
+      ),
+    spaPageViews: z
+      .boolean()
+      .default(false)
+      .describe(
+        "SPA page views::Emit a Hotjar virtual page view (<code>hj('stateChange', path)</code>) on every Jitsu <code>page</code> event. Enable this for single-page apps. Leave off to rely on Hotjar's built-in page detection and avoid double-counting."
+      ),
+    trackProperties: z
+      .enum(["ignore", "attributes"])
+      .default("ignore")
+      .describe(
+        "Track event properties::Hotjar events carry only a name and have no per-event property API. Choose <code>attributes</code> to merge <code>track</code> properties into the identified user's record (requires a known user), or <code>ignore</code> to send the event name only."
+      ),
+  }),
+  deviceOptions: {
+    type: "internal-plugin",
+    name: "hotjar",
   } as DeviceOptions,
   connectionOptions: DeviceDestinationsConnectionOptions,
 };
@@ -386,6 +493,18 @@ const gtmDeviceDestination = {
   credentials: z.object({
     containerId: z.string().describe("The Container ID uniquely identifies the GTM Container."),
     dataLayerName: z.string().default("dataLayer").describe("The name of the data layer variable."),
+    loadGtm: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Load GTM::Whether Jitsu should load the Google Tag Manager script. Disable this if you load GTM yourself (e.g. on page load) so tags are ready before navigation — Jitsu will only push events to the data layer."
+      ),
+    resetDataLayer: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Reset Data Layer::Clear the data Jitsu pushed after each event so values don't leak between events. GTM merges every push into a single persistent data model, so without resetting, properties from one event (event properties, traits, user data, etc.) stay set and can be picked up by tags firing on later, unrelated events. Recommended. Disable only if you intentionally rely on values persisting across events, or if another system already manages clearing the data layer."
+      ),
   }),
   deviceOptions: {
     type: "internal-plugin",
@@ -399,6 +518,8 @@ export const coreDestinations: DestinationType<any>[] = [
   gaDeviceDestination,
   gtmDeviceDestination,
   logRocketDestination,
+  clarityDestination,
+  hotjarDestination,
   {
     id: "clickhouse",
     usesBulker: true,
@@ -922,6 +1043,57 @@ export const coreDestinations: DestinationType<any>[] = [
     description: "Facebook Conversion API is a tool for sending events to Facebook Ads Manager.",
   },
   {
+    id: "google-ads",
+    icon: googleAdsIcon,
+    title: "Google Ads",
+    tags: "Product Analytics",
+    connectionOptions: CloudDestinationsConnectionOptions,
+    credentials: meta.GoogleAdsCredentials,
+    credentialsUi: meta.GoogleAdsCredentialsUi,
+    description: (
+      <>
+        Jitsu sends conversions to Google Ads through the{" "}
+        <a href="https://developers.google.com/data-manager/api" target="_blank" rel="noreferrer noopener">
+          Data Manager API
+        </a>{" "}
+        (or the legacy Google Ads API, for accounts already allowlisted for it). Events are matched using{" "}
+        <code>gclid</code>/<code>gbraid</code>/<code>wbraid</code> click ids and hashed user data such as email and
+        phone number.
+      </>
+    ),
+    documentation: (
+      <>
+        <p>
+          Jitsu forwards <code>track</code>, <code>page</code> and <code>screen</code> events as Google Ads conversions.
+          Use the <b>Events</b> field to choose which ones, and <b>Per-event Conversion Actions</b> to route different
+          events to different conversion actions.
+        </p>
+        <p>
+          <b>Conversion Type.</b> In <code>conversion</code> mode Jitsu reports new conversions — offline click
+          conversions matched on <code>gclid</code>, and <i>Enhanced Conversions for Leads</i> matched on hashed user
+          data. In <code>enhancement</code> mode it performs <i>Enhanced Conversions for Web</i> instead: rather than
+          creating conversions it attaches hashed user data to conversions your Google tag already recorded, matched by
+          order ID. Enhancement mode needs a <b>Website</b> conversion action, and skips any event that has no order ID
+          or no user data.
+        </p>
+        <p>
+          <b>Matching.</b> Google needs at least one signal to attribute a conversion. Jitsu looks for a click id on the
+          event (from the SDK, or from the page URL), then falls back to one it remembered earlier for the same user,
+          then to hashed user data from traits. Events with none of these are skipped.
+        </p>
+        <p>
+          <b>Remembering click ids.</b> A user usually clicks the ad on one visit and converts on another, so Jitsu
+          watches every event for a <code>gclid</code> and keeps it against that user for 90 days. The conversion is
+          then still attributed to the ad that earned it, even though the click id is long gone from the URL.
+        </p>
+        <p>
+          <b>Personal data</b> — email, phone, and names — is normalized and SHA-256 hashed before it leaves Jitsu, as
+          Google requires. Country and postal code are sent in the clear, which is also what Google expects.
+        </p>
+      </>
+    ),
+  },
+  {
     id: "june",
     icon: juneIcon,
     title: "June.so",
@@ -929,6 +1101,36 @@ export const coreDestinations: DestinationType<any>[] = [
     connectionOptions: CloudDestinationsConnectionOptions,
     credentials: meta.JuneCredentials,
     description: "June.so is a product analytics platform that provides insights into user behavior.",
+  },
+  {
+    id: "resend",
+    icon: resendIcon,
+    title: "Resend",
+    tags: "Email",
+    connectionOptions: CloudDestinationsConnectionOptions,
+    credentials: meta.ResendCredentials,
+    credentialsUi: meta.ResendCredentialsUi,
+    description: (
+      <>
+        Jitsu syncs users to Resend as contacts. Each <code>.identify()</code> creates or updates a contact and adds it
+        to a segment. Other events update the contact&apos;s properties. Contacts are matched by email.
+      </>
+    ),
+  },
+  {
+    id: "sendgrid",
+    icon: sendgridIcon,
+    title: "SendGrid",
+    tags: "Email",
+    connectionOptions: CloudDestinationsConnectionOptions,
+    credentials: meta.SendgridCredentials,
+    credentialsUi: meta.SendgridCredentialsUi,
+    description: (
+      <>
+        Jitsu syncs users to SendGrid as marketing contacts. Each <code>.identify()</code> upserts a contact and adds it
+        to a list. Other events update the contact&apos;s fields. Contacts are matched by email.
+      </>
+    ),
   },
   {
     id: "braze",
@@ -987,6 +1189,11 @@ export const coreDestinations: DestinationType<any>[] = [
     tags: "Product Analytics",
     connectionOptions: CloudDestinationsConnectionOptions,
     credentials: meta.PosthogDestinationConfig,
+    credentialsUi: {
+      host: {
+        clientValidator: validatePosthogHost,
+      },
+    },
     description:
       "Posthog is an open-source product analytics tool. Jitsu supports both self-hosted Posthog and Posthog Cloud.",
   },
@@ -1085,6 +1292,9 @@ export const coreDestinations: DestinationType<any>[] = [
     ),
     credentials: meta.WebhookDestinationConfig,
     credentialsUi: {
+      url: {
+        clientValidator: validateWebhookUrl,
+      },
       headers: {
         editor: "StringArrayEditor",
       },
@@ -1093,9 +1303,26 @@ export const coreDestinations: DestinationType<any>[] = [
         editorProps: { languages: ["json", "text"], height: "300", syntaxCheck: { json: false } },
         hidden: obj => !obj.customPayload,
       },
+      signatureSecret: {
+        password: true,
+        placeholder: "Enter secret for this destination",
+        hidden: obj => obj.signatureMethod !== "hmac",
+      },
+      signaturePrivateKey: {
+        password: true,
+        textarea: true,
+        placeholder: "-----BEGIN PRIVATE KEY-----",
+        hidden: obj => obj.signatureMethod !== "ed25519",
+      },
+      signatureHeader: {
+        hidden: obj => !obj.signatureMethod || obj.signatureMethod === "none",
+      },
+      signatureIncludeTimestamp: {
+        hidden: obj => !obj.signatureMethod || obj.signatureMethod === "none",
+      },
     },
     description:
-      "Send data to any HTTP endpoint. You can use this destination to send data to Slack, Discord, or any other service that accepts HTTP requests. ",
+      "Send data to any HTTP endpoint. You can use this destination to send data to Slack, Discord, or any other service that accepts HTTP requests. Requests can optionally be signed (HMAC-SHA256 or Ed25519) so your endpoint can verify their authenticity.",
   },
 ];
 

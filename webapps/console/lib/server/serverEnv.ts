@@ -69,6 +69,16 @@ const ServerEnvSchema = ClientEnvSchema.extend({
   // Enable/disable syncs feature globally
   SYNCS_ENABLED: z.string().default("false").transform(isTruish),
 
+  // Segment/RudderStack migration analyzer entry points (JITSU-131)
+  MIGRATION_WIZARD_ENABLED: z.string().default("false").transform(isTruish),
+
+  // Booking link on the migration report's call CTA (JITSU-128)
+  MIGRATION_CALENDLY_URL: z.string().optional(),
+
+  // Extra allowed CORS origins for the migration proxy (comma-separated;
+  // jitsu.com and *.localhost are always allowed)
+  MIGRATION_CORS_ORIGINS: z.string().optional(),
+
   // Sync task log retention age in days
   SYNC_TASK_LOG_AGE: z.coerce.number().optional().default(60),
 
@@ -232,6 +242,11 @@ const ServerEnvSchema = ClientEnvSchema.extend({
   // Disable new user registration
   DISABLE_SIGNUP: z.string().default("false").transform(isTruish),
 
+  // Reject signups from personal email domains (require a work email). Applies to
+  // Google and email/password signups; GitHub is exempt (devs often have a
+  // personal email on their GitHub account). See JITSU-70.
+  LIMIT_PERSONAL_EMAILS: z.string().default("false").transform(isTruish),
+
   // Enable MIT-compliant mode (disables proprietary features)
   MIT_COMPLIANT: z.string().default("false").transform(isTruish),
 
@@ -353,8 +368,21 @@ const ServerEnvSchema = ClientEnvSchema.extend({
   // Comma-separated list of data domains
   DATA_DOMAIN: z.string().optional(),
 
-  // ISO date string for read-only mode expiration
-  JITSU_CONSOLE_READ_ONLY_UNTIL: z.string().optional(),
+  // Maintenance descriptor as a JSON object (fallback when no ConfigMap file is mounted).
+  // Time-boxed maintenance windows are driven entirely by this descriptor.
+  MAINTENANCE: z.string().optional(),
+  // Path to a mounted ConfigMap JSON file holding the maintenance descriptor. Takes
+  // precedence over MAINTENANCE so maintenance can be toggled at runtime without redeploy.
+  MAINTENANCE_CONFIG_FILE: z.string().optional(),
+
+  // Hard, permanent read-only switch, independent of the maintenance descriptor.
+  // When true the API layer, the Prisma backstop and MCP tools all reject writes
+  // (same enforcement as an active maintenance window) but WITHOUT showing a
+  // maintenance page or claiming the DB is offline — reads work normally. Set for
+  // canary / preview deployments (see JITSU-159) that share the production DB and
+  // must never mutate it. Unlike MAINTENANCE this is a deploy-time constant, not a
+  // runtime-toggleable window.
+  JITSU_CONSOLE_READ_ONLY: z.string().default("false").transform(isTruish),
 
   // Documentation website URL
   JITSU_DOCUMENTATION_URL: z.string().optional().default("https://docs.jitsu.com/"),
@@ -413,7 +441,10 @@ export function getServerEnv(): ServerEnv {
   if (typeof window !== "undefined" && typeof window.document !== "undefined") {
     return getClientEnv() as unknown as ServerEnv;
   }
-  if (serverEnvCache) {
+  // Skip the cache under vitest (VITEST is set in every vitest worker) so
+  // vi.stubEnv takes effect for call-time readers. Module-level snapshots are
+  // still frozen at import — the test setup provides baseline env for those.
+  if (serverEnvCache && !process.env.VITEST) {
     return serverEnvCache;
   }
 

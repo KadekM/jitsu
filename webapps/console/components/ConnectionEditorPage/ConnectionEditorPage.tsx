@@ -6,7 +6,7 @@ import { SomeZodObject, z } from "zod";
 import { ConfigurationObjectLinkDbModel } from "../../prisma/schema";
 import { useRouter } from "next/router";
 import { assertTrue, getLog, requireDefined } from "juava";
-import { Button, Input, InputNumber, Radio, Switch, Tooltip } from "antd";
+import { Alert, Button, Input, InputNumber, Radio, Switch, Tooltip } from "antd";
 import { BaseBulkerConnectionOptions, getCoreDestinationType } from "../../lib/schema/destinations";
 import { confirmOp, copyTextToClipboard, feedbackError, feedbackSuccess } from "../../lib/ui";
 import FieldListEditorLayout, { EditorItem } from "../FieldListEditorLayout/FieldListEditorLayout";
@@ -150,10 +150,9 @@ export const SyncFrequencyEditor: EditorComponent<ConnectionOptionsType["frequen
 }) => (
   <InputNumber
     disabled={disabled}
-    value={value || 60}
+    value={value}
     size="small"
     addonAfter={"Minutes"}
-    defaultValue={60}
     className="w-36"
     min={1}
     max={60 * 24}
@@ -240,9 +239,18 @@ function ConnectionEditor({
   const destinationType = getCoreDestinationType(destination.destinationType);
   const connectionOptionsZodType = destinationType.connectionOptions;
 
-  const [connectionOptions, setConnectionOptions] = useState<ConnectionOptionsType>(
-    connectionOptionsZodType.parse(existingLink?.data || {})
-  );
+  // parse() fills the schema's 60m default for an absent `frequency`. That's right
+  // for a new connection (the value is persisted on save), but an existing link
+  // saved without `frequency` really runs on bulker's fallback period
+  // (BATCH_RUNNER_DEFAULT_PERIOD_SEC, 1m in cloud) — keep the field empty so the
+  // editor shows that instead of a value that was never stored.
+  const [connectionOptions, setConnectionOptions] = useState<ConnectionOptionsType>(() => {
+    const parsed = connectionOptionsZodType.parse(existingLink?.data || {});
+    if (existingLink && (existingLink.data as any)?.frequency == null) {
+      parsed.frequency = undefined;
+    }
+    return parsed;
+  });
 
   //Once destination is changed, we need to update default connection options
   const updateConnectionOptions = (selectedDestination: string) => {
@@ -342,12 +350,25 @@ function ConnectionEditor({
         </>
       ),
       component: (
-        <BatchOrStreamEditor
-          value={connectionOptions.mode}
-          disabled={!canEdit}
-          limitations={limitations}
-          onChange={mode => updateOptions({ mode })}
-        />
+        <>
+          <BatchOrStreamEditor
+            value={connectionOptions.mode}
+            disabled={!canEdit}
+            limitations={limitations}
+            onChange={mode => updateOptions({ mode })}
+          />
+          {destinationType.id === "webhook" &&
+            destination.signatureMethod &&
+            destination.signatureMethod !== "none" &&
+            connectionOptions.mode === "batch" && (
+              <Alert
+                className="mt-2"
+                type="warning"
+                showIcon
+                message="Request signing is not applied in batch mode. Switch to stream mode if you need signed webhooks."
+              />
+            )}
+        </>
       ),
     });
   }
@@ -357,7 +378,7 @@ function ConnectionEditor({
       component: (
         <SyncFrequencyEditor
           disabled={!canEdit}
-          value={connectionOptions.frequency || 60}
+          value={connectionOptions.frequency ?? 1}
           onChange={frequency => updateOptions({ frequency })}
         />
       ),

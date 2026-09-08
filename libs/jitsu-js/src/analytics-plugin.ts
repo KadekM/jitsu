@@ -151,7 +151,49 @@ function getCookie(name: string) {
   return parts.length === 2 ? parts.pop()?.split(";").shift() : undefined;
 }
 
-function getClientIds(runtime: RuntimeFacade, customCookieCapture: Record<string, string>) {
+//Google Ads auto-tagging appends these to the landing page URL. Google's own conversion linker
+//stores gclid in _gcl_aw and dclid in _gcl_dc as `GCL.<timestamp>.<id>`, so we read the cookies too
+//- that keeps the id available on later page views, but only when the customer also runs gtag.
+const googleClickIdCookies = {
+  gclid: "_gcl_aw",
+  dclid: "_gcl_dc",
+};
+
+function parseGclCookie(cookieValue: string | undefined) {
+  if (typeof cookieValue !== "string" || !cookieValue) {
+    return undefined;
+  }
+  //`GCL.1712345678.SomeClickId` - the id is everything after the timestamp, and may itself
+  //contain dots, so only the first two segments are dropped.
+  const parts = cookieValue.split(".");
+  return parts.length >= 3 ? parts.slice(2).join(".") : undefined;
+}
+
+function getGoogleClickIds(runtime: RuntimeFacade, query: Record<string, string>) {
+  const clickIds = {};
+  //URL params win: they're the authoritative value for this click, and they work whether or not
+  //gtag is installed. gbraid/wbraid have no documented cookie, so the URL is the only source.
+  for (const name of ["gclid", "gbraid", "wbraid", "dclid"]) {
+    if (query[name]) {
+      clickIds[name] = query[name];
+    }
+  }
+  for (const [key, cookieName] of Object.entries(googleClickIdCookies)) {
+    if (!clickIds[key]) {
+      const fromCookie = parseGclCookie(runtime.getCookie(cookieName));
+      if (fromCookie) {
+        clickIds[key] = fromCookie;
+      }
+    }
+  }
+  return clickIds;
+}
+
+function getClientIds(
+  runtime: RuntimeFacade,
+  customCookieCapture: Record<string, string>,
+  query: Record<string, string>
+) {
   const cookieCapture = {
     fbc: "_fbc",
     fbp: "_fbp",
@@ -163,6 +205,7 @@ function getClientIds(runtime: RuntimeFacade, customCookieCapture: Record<string
   }, {});
   return {
     ...clientIds,
+    ...getGoogleClickIds(runtime, query),
     ...getGa4Ids(runtime),
   };
 }
@@ -569,6 +612,7 @@ function adjustPayload(
           }
         : undefined,
     userAgent: runtime.userAgent?.(),
+    headers: runtime.headers?.(),
     locale: runtime.language?.(),
     screen: runtime.screen?.(),
     ip: runtime?.ip?.(),
@@ -589,7 +633,7 @@ function adjustPayload(
       url: properties.url || url,
       encoding: properties.encoding || runtime.documentEncoding(),
     },
-    clientIds: !config.privacy?.disableUserIds ? getClientIds(runtime, config.cookieCapture || {}) : undefined,
+    clientIds: !config.privacy?.disableUserIds ? getClientIds(runtime, config.cookieCapture || {}, query) : undefined,
     campaign: parseUtms(query),
   };
   const withContext = {
@@ -787,7 +831,8 @@ async function send(
   payload,
   jitsuConfig: JitsuOptions,
   instance: AnalyticsInstance,
-  store: PersistentStorage
+  store: PersistentStorage,
+  isAutoIdentify?: boolean
 ): Promise<any> {
   const s2s = !!jitsuConfig.s2s;
   const debugHeader = jitsuConfig.debug ? { "X-Enable-Debug": "true" } : {};
@@ -833,7 +878,8 @@ async function send(
       clearTimeout(abortTimeout);
     }
   } catch (e: any) {
-    getErrorHandler(jitsuConfig)(`Call to ${url} failed with error ${e.message}`);
+    const errorHandler = isAutoIdentify ? msg => console.warn(msg) : getErrorHandler(jitsuConfig);
+    errorHandler(`Call to ${url} failed with error ${e.message}`);
     return Promise.resolve();
   }
   let responseText;
@@ -854,7 +900,8 @@ async function send(
     );
   }
   if (!fetchResult.ok) {
-    getErrorHandler(jitsuConfig)(
+    const errorHandler = isAutoIdentify ? msg => console.warn(msg) : getErrorHandler(jitsuConfig);
+    errorHandler(
       `Call to ${url} failed with error: ${fetchResult.status} - ${fetchResult.statusText}: ${responseText}`
     );
     return Promise.resolve();
@@ -864,7 +911,8 @@ async function send(
   try {
     responseJson = JSON.parse(responseText);
   } catch (e) {
-    getErrorHandler(jitsuConfig)(`Can't parse JSON: ${responseText}: ${e?.message}`);
+    const errorHandler = isAutoIdentify ? msg => console.warn(msg) : getErrorHandler(jitsuConfig);
+    errorHandler(`Can't parse JSON: ${responseText}: ${e?.message}`);
     return Promise.resolve();
   }
 
@@ -951,14 +999,22 @@ export const jitsuAnalyticsPlugin = (jitsuOptions: JitsuOptions = {}, storage: P
       if (config.privacy?.dontSend) {
         return;
       }
-      return send("page", payload, config, instance, storage);
+      const promise = send("page", payload, config, instance, storage);
+      if (promise && typeof promise.catch === "function") {
+        promise.catch(() => {});
+      }
+      return promise;
     },
     track: args => {
       const { payload, config, instance } = args;
       if (config.privacy?.dontSend) {
         return;
       }
-      return send("track", payload, config, instance, storage);
+      const promise = send("track", payload, config, instance, storage);
+      if (promise && typeof promise.catch === "function") {
+        promise.catch(() => {});
+      }
+      return promise;
     },
     identify: args => {
       const { payload, config, instance } = args;
@@ -975,7 +1031,12 @@ export const jitsuAnalyticsPlugin = (jitsuOptions: JitsuOptions = {}, storage: P
       if (doNotSend) {
         return Promise.resolve();
       }
-      return send("identify", payload, config, instance, storage);
+      const isAutoIdentify = payload.options?.autoIdentify === true;
+      const promise = send("identify", payload, config, instance, storage, isAutoIdentify);
+      if (promise && typeof promise.catch === "function") {
+        promise.catch(() => {});
+      }
+      return promise;
     },
     reset: args => {
       const { config, instance } = args;

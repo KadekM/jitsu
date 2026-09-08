@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,12 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jitsucom/bulker/jitsubase/appbase"
 	"github.com/jitsucom/bulker/jitsubase/uuid"
+	"google.golang.org/api/iterator"
 )
 
 // Compile regex once at package level for performance
@@ -32,21 +35,119 @@ const (
 	JobStatusCancelled ReprocessingJobStatus = "cancelled"
 )
 
+// StreamSelector selects which streams to reprocess and, optionally, which
+// connections their events are routed to. It accepts two JSON shapes:
+//
+//	["stream1", "stream2"]                              // ids only
+//	{"stream1": ["con1", "con2"], "stream2": "con3"}    // ids -> connection ids
+//	{"stream1": ["*", "con1"], "*": "*"}                // wildcards
+//
+// In the plain form connections come from the repository, as usual. In the map
+// form the listed connections apply per stream; a single connection id may be
+// given instead of a list. "*" as a key stands for every stream, and "*" as a
+// connection id stands for the stream's repository-mapped connections — so
+// {"stream1": ["*", "con1"]} means "everything it normally goes to, plus con1"
+// in override mode and "no connection filtering" in filter mode.
+// Either way, only the selected streams are reprocessed; omitting the
+// field reprocesses all of them, while an explicitly empty list or map selects
+// nothing (nil vs empty is meaningful here and survives the round-trip to the
+// workers' ConfigMap).
+type StreamSelector struct {
+	// Ids is the plain form: stream ids or slugs.
+	Ids []string
+	// Connections is the map form: stream id/slug (or "*") -> connection ids.
+	Connections map[string][]string
+}
+
+// WildcardStream is the StreamSelector map key matching every stream; used as a
+// connection id it stands for the stream's repository-mapped connections.
+const WildcardStream = "*"
+
+func (s *StreamSelector) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*s = StreamSelector{}
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		raw := map[string]interface{}{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("stream_ids: expected a map of stream id to connection ids: %w", err)
+		}
+		connections := make(map[string][]string, len(raw))
+		for streamId, value := range raw {
+			conns, err := parseConnectionList(value)
+			if err != nil {
+				return fmt.Errorf("stream_ids[%q]: %w", streamId, err)
+			}
+			connections[streamId] = conns
+		}
+		*s = StreamSelector{Connections: connections}
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal(data, &ids); err != nil {
+		return fmt.Errorf("stream_ids: expected a list of stream ids or a map of stream id to connection ids: %w", err)
+	}
+	*s = StreamSelector{Ids: ids}
+	return nil
+}
+
+// parseConnectionList accepts a single connection id or a list of them, so
+// {"stream1": "con1"} and {"stream1": ["con1"]} are equivalent. Stored
+// normalized as a list.
+func parseConnectionList(value interface{}) ([]string, error) {
+	switch v := value.(type) {
+	case string:
+		return []string{v}, nil
+	case []interface{}:
+		conns := make([]string, 0, len(v))
+		for _, item := range v {
+			id, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("connection ids must be strings, got %T", item)
+			}
+			conns = append(conns, id)
+		}
+		return conns, nil
+	default:
+		return nil, fmt.Errorf("expected a connection id or a list of them, got %T", value)
+	}
+}
+
+func (s StreamSelector) MarshalJSON() ([]byte, error) {
+	if s.Connections != nil {
+		return json.Marshal(s.Connections)
+	}
+	if s.Ids != nil {
+		return json.Marshal(s.Ids)
+	}
+	return []byte("null"), nil
+}
+
 // ReprocessingJobConfig contains configuration for starting a reprocessing job
 type ReprocessingJobConfig struct {
-	S3Path        string    `json:"s3_path,omitempty"`    // S3 path (s3://bucket/prefix)
-	LocalPath     string    `json:"local_path,omitempty"` // Local filesystem path
-	StreamIds     []string  `json:"stream_ids,omitempty"`
-	ConnectionIds []string  `json:"connection_ids,omitempty"`
-	Files         []string  `json:"files,omitempty"` // Optional list of specific files to process
-	DryRun        bool      `json:"dry_run"`
-	StartFile     string    `json:"start_file,omitempty"`
-	StartLine     int64     `json:"start_line,omitempty"`
-	BatchSize     int       `json:"batch_size,omitempty"`
-	RetryAttempts int       `json:"retry_attempts,omitempty"` // Number of retry attempts for file processing (default: 3)
-	DateFrom      time.Time `json:"date_from,omitempty"`      // Filter messages created after this date
-	DateTo        time.Time `json:"date_to,omitempty"`        // Filter messages created before this date
-	Limit         int64     `json:"limit,omitempty"`          // Maximum number of events to process
+	S3Path        string         `json:"s3_path,omitempty"`    // S3 path (s3://bucket/prefix)
+	GCSPath       string         `json:"gcs_path,omitempty"`   // GCS path (gs://bucket/prefix)
+	LocalPath     string         `json:"local_path,omitempty"` // Local filesystem path
+	StreamIds     StreamSelector `json:"stream_ids,omitempty"`
+	Events        []string       `json:"events,omitempty"` // Event types or track event names to process
+	Files         []string       `json:"files,omitempty"`  // Optional list of specific files to process
+	DryRun        bool           `json:"dry_run"`
+	StartFile     string         `json:"start_file,omitempty"`
+	StartLine     int64          `json:"start_line,omitempty"`
+	BatchSize     int            `json:"batch_size,omitempty"`
+	RetryAttempts int            `json:"retry_attempts,omitempty"` // Number of retry attempts for file processing (default: 3)
+	DateFrom      time.Time      `json:"date_from,omitempty"`      // Filter messages created after this date
+	DateTo        time.Time      `json:"date_to,omitempty"`        // Filter messages created before this date
+	Limit         int64          `json:"limit,omitempty"`          // Maximum number of events to process
+	// ParallelWorkers caps how many worker pods run at once (K8s Job
+	// parallelism). 0 = fall back to the K8S_MAX_PARALLEL_WORKERS env cap.
+	ParallelWorkers int `json:"parallel_workers,omitempty"`
+	// ConnectionsFilter switches the StreamSelector map form from override
+	// mode (listed connections replace the repository-mapped ones) to filter
+	// mode (repository-mapped connections are kept only if listed).
+	ConnectionsFilter bool `json:"connections_filter,omitempty"`
 }
 
 // ReprocessingJob represents a failover reprocessing job
@@ -114,14 +215,20 @@ func NewReprocessingJobManager(config *Config, dbpool *pgxpool.Pool, k8sClient *
 func (m *ReprocessingJobManager) StartJob(config ReprocessingJobConfig) (*ReprocessingJob, error) {
 	m.Infof("[StartJob] Starting new reprocessing job")
 
-	// Validate that either S3 or local path is provided
-	if config.S3Path == "" && config.LocalPath == "" {
-		m.Errorf("[StartJob] Validation failed: no path provided")
-		return nil, fmt.Errorf("either s3_path or local_path must be provided")
+	// Exactly one input source must be provided.
+	sourceCount := 0
+	for _, source := range []string{config.S3Path, config.GCSPath, config.LocalPath} {
+		if source != "" {
+			sourceCount++
+		}
 	}
-	if config.S3Path != "" && config.LocalPath != "" {
-		m.Errorf("[StartJob] Validation failed: both paths provided")
-		return nil, fmt.Errorf("only one of s3_path or local_path can be provided")
+	if sourceCount == 0 {
+		m.Errorf("[StartJob] Validation failed: no path provided")
+		return nil, fmt.Errorf("one of s3_path, gcs_path, or local_path must be provided")
+	}
+	if sourceCount > 1 {
+		m.Errorf("[StartJob] Validation failed: multiple paths provided")
+		return nil, fmt.Errorf("only one of s3_path, gcs_path, or local_path can be provided")
 	}
 
 	// Set defaults
@@ -134,7 +241,7 @@ func (m *ReprocessingJobManager) StartJob(config ReprocessingJobConfig) (*Reproc
 	ctx := context.Background()
 
 	// List and prepare files with sizes
-	m.Infof("[StartJob] Preparing file list from %s%s", config.S3Path, config.LocalPath)
+	m.Infof("[StartJob] Preparing file list from %s%s%s", config.S3Path, config.GCSPath, config.LocalPath)
 	fileItems, err := m.prepareFileList(ctx, config)
 	if err != nil {
 		m.Errorf("[StartJob] Failed to prepare file list: %v", err)
@@ -234,6 +341,11 @@ func (m *ReprocessingJobManager) prepareFileList(ctx context.Context, config Rep
 		fileItems, err = m.listS3Files(ctx, config.S3Path)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list S3 files: %w", err)
+		}
+	} else if config.GCSPath != "" {
+		fileItems, err = m.listGCSFiles(ctx, config.GCSPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list GCS files: %w", err)
 		}
 	} else if config.LocalPath != "" {
 		fileItems, err = m.listLocalFiles(config.LocalPath)
@@ -579,6 +691,60 @@ func (m *ReprocessingJobManager) listS3Files(ctx context.Context, s3Path string)
 	})
 
 	return files, nil
+}
+
+// listGCSFiles lists all NDJSON files in the GCS path. The client uses
+// Application Default Credentials, which includes GKE Workload Identity.
+func (m *ReprocessingJobManager) listGCSFiles(ctx context.Context, gcsPath string) ([]FileItem, error) {
+	bucket, prefix, err := parseGCSPath(gcsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCS client: %w", err)
+	}
+	defer client.Close()
+
+	var files []FileItem
+	objects := client.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	for {
+		attrs, err := objects.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasSuffix(attrs.Name, ".ndjson") || strings.HasSuffix(attrs.Name, ".ndjson.gz") {
+			files = append(files, FileItem{
+				Path:         fmt.Sprintf("gs://%s/%s", bucket, attrs.Name),
+				Size:         attrs.Size,
+				LastModified: attrs.Updated,
+			})
+		}
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
+	return files, nil
+}
+
+func parseGCSPath(gcsPath string) (bucket, object string, err error) {
+	const prefix = "gs://"
+	if !strings.HasPrefix(gcsPath, prefix) {
+		return "", "", fmt.Errorf("invalid GCS path %q: expected gs://bucket/path", gcsPath)
+	}
+	parts := strings.SplitN(strings.TrimPrefix(gcsPath, prefix), "/", 2)
+	if parts[0] == "" {
+		return "", "", fmt.Errorf("invalid GCS path %q: bucket is required", gcsPath)
+	}
+	if len(parts) == 2 {
+		object = parts[1]
+	}
+	return parts[0], object, nil
 }
 
 // listLocalFiles lists all NDJSON files in the local path recursively

@@ -5,6 +5,7 @@ import { useBilling } from "./BillingProvider";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import { ActiveEventsReport } from "../../lib/shared/reporting";
+import { usagePercentage } from "./usage-percentage";
 dayjs.extend(utc);
 
 export type Usage = {
@@ -49,11 +50,15 @@ export function useEventsUsage(opts?: { skipSubscribed?: boolean; cacheSeconds?:
     periodStart = new Date(billing.settings?.currentPeriod.start);
   } else {
     periodStart = dayjs().utc().startOf("month").toDate();
-    periodEnd = dayjs().utc().endOf("month").add(-1, "millisecond").toDate();
+    // Exclusive end (start of next month), matching the billing API's convention
+    // so this fallback path agrees with a real currentPeriod.
+    periodEnd = dayjs().utc().startOf("month").add(1, "month").toDate();
   }
 
   const { isLoading, error, data } = useQuery(
-    ["billing usage", workspace.id, opts?.skipSubscribed, billing.settings.planId],
+    // periodStart is part of the key so that crossing a period boundary refetches
+    // instead of serving the previous period's total from cache.
+    ["billing usage", workspace.id, opts?.skipSubscribed, billing.settings.planId, periodStart.toISOString()],
     async () => {
       if (opts?.skipSubscribed && billing.settings.planId !== "free") {
         //if workspace is subscribed to a paid plan - we don't really need usage in some cases
@@ -86,7 +91,7 @@ export function useEventsUsage(opts?: { skipSubscribed?: boolean; cacheSeconds?:
           events: data.usage,
           projectionByTheEndOfPeriod: projection,
           maxAllowedDestinatonEvents: billing.settings.destinationEvensPerMonth,
-          usagePercentage: data.usage / billing.settings.destinationEvensPerMonth,
+          usagePercentage: usagePercentage(data.usage, billing.settings.destinationEvensPerMonth),
         }
       : undefined,
   };

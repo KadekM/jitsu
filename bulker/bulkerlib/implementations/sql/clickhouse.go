@@ -242,6 +242,8 @@ func NewClickHouse(bulkerConfig bulkerlib.Config) (bulkerlib.Bulker, error) {
 
 	dbConnectFunction := func(ctx context.Context, config *ClickHouseConfig) (*sql.DB, error) {
 		dsn := clickhouseDriverConnectionString(config)
+		//log only what identifies the destination - the dsn embeds the password
+		logging.Infof("[%s] connecting: %s db=%s", bulkerConfig.Id, strings.Join(config.Hosts, ","), config.Database)
 		dataSource, err := sql.Open("clickhouse", dsn)
 		if err != nil {
 			return nil, err
@@ -354,7 +356,6 @@ func clickhouseDriverConnectionString(config *ClickHouseConfig) string {
 		}
 		connectionString += strings.Join(paramList, "&")
 	}
-	//logging.Infof("Connection string: %s", connectionString)
 	return connectionString
 }
 

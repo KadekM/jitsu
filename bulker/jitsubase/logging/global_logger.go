@@ -121,10 +121,19 @@ func Warn(v ...any) {
 	log.Warnln(v...)
 }
 
+// Fatal-level failures abort the process (typically failure to start), so they
+// carry the "System error:" marker used by log-based alerting.
 func Fatal(v ...any) {
-	log.Fatal(v...)
+	msg := []any{"System error:"}
+	msg = append(msg, v...)
+	// Fatalln, not Fatal: logrus renders Fatal with fmt.Sprint, which only puts
+	// spaces between operands when neither is a string, so the marker would be
+	// glued to a string argument ("System error:cannot start") and stop matching
+	// the alert query. The ln variants join every operand with a single space
+	// (and drop the trailing newline), which is also what Warn above relies on.
+	log.Fatalln(msg...)
 }
 
 func Fatalf(format string, v ...any) {
-	log.Fatalf(format, v...)
+	log.Fatalf("System error: "+format, v...)
 }

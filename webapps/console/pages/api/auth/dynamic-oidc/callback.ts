@@ -11,6 +11,7 @@ import { isSecure } from "../../../../lib/server/origin";
 import { redirectWithOidcError, OidcErrors } from "../../../../lib/server/oidc-error-handler";
 import { getServerEnv } from "../../../../lib/server/serverEnv";
 import { authAuditLog } from "../../../../lib/server/audit-log";
+import { trackAuthEvent } from "../../../../lib/server/telemetry";
 
 const log = getServerLog("api/auth/dynamic-oidc/callback");
 
@@ -264,7 +265,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     try {
       const userEmail = user.email || email;
-      await authAuditLog({ internalId: user.id, email: userEmail, name: user.name || userEmail }, "login", "oidc");
+      await authAuditLog(
+        { internalId: user.id, email: userEmail, name: user.name || userEmail },
+        "login",
+        "oidc",
+        undefined,
+        req
+      );
+      await trackAuthEvent(
+        { internalId: user.id, email: userEmail, name: user.name || userEmail, externalId: user.externalId },
+        "login",
+        "oidc"
+      );
     } catch (err) {
       log
         .atError()

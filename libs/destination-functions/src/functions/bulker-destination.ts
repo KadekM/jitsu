@@ -209,6 +209,54 @@ export function plural(s: string) {
   }
 }
 
+// bulker's warehouse-agnostic JSON data type: numeric value 6 of the DataType enum
+// (bulker/bulkerlib/types/datatype.go: UNKNOWN=0, BOOL=1, INT64=2, FLOAT64=3, STRING=4,
+// TIMESTAMP=5, JSON=6). SchemaField.Type has no string form over the wire - it is
+// serialized as the enum's int value.
+export const BULKER_JSON_DATA_TYPE = 6;
+
+// Declaring `context_headers` in the stream `schema` option makes bulker keep the nested
+// context.headers object as a single column of the warehouse-native JSON type (jsonb /
+// SUPER / JSON / string) instead of flattening it into one column per header name -
+// header names are client-controlled, so flattening would create unbounded columns.
+// Applied only when the event actually carries a context.headers object, so connections
+// that never see headers don't get an eagerly created column (in batch mode schema
+// columns are added to the table even without data). Never applied for jitsu-legacy,
+// which doesn't carry context.headers.
+export function withContextHeadersSchema(streamOptions: any, dataLayout: DataLayoutType, event: any): any {
+  const contextHeaders = event?.context?.headers;
+  if (
+    dataLayout === "jitsu-legacy" ||
+    typeof contextHeaders !== "object" ||
+    contextHeaders === null ||
+    Array.isArray(contextHeaders)
+  ) {
+    return streamOptions;
+  }
+  // streamOptions is untyped user config. bulker also accepts `schema` as a JSON string -
+  // don't merge into anything that isn't a plain object (spreading a string would explode
+  // it into character keys), and don't touch a malformed schema.fields
+  const schema = streamOptions?.schema;
+  if (typeof schema !== "undefined" && (typeof schema !== "object" || schema === null || Array.isArray(schema))) {
+    return streamOptions;
+  }
+  const rawFields = schema?.fields;
+  if (typeof rawFields !== "undefined" && !Array.isArray(rawFields)) {
+    return streamOptions;
+  }
+  const fields = rawFields ?? [];
+  if (fields.some(f => f?.name === "context_headers")) {
+    return streamOptions;
+  }
+  return {
+    ...streamOptions,
+    schema: {
+      ...schema,
+      fields: [...fields, { name: "context_headers", type: BULKER_JSON_DATA_TYPE }],
+    },
+  };
+}
+
 export const dataLayouts: Record<DataLayoutType, DataLayoutImpl<any>> = {
   segment: (event, ctx) => segmentLayout(event, false, ctx),
   "segment-single-table": (event, ctx) => segmentLayout(event, true, ctx),
@@ -249,6 +297,7 @@ const BulkerDestination: JitsuFunction<AnalyticsServerEvent, BulkerDestinationCo
         }
       }
     }
+    const effectiveStreamOptions = withContextHeadersSchema(streamOptions, dataLayout, adjustedEvent);
     const events = dataLayouts[dataLayout](adjustedEvent, ctx);
     for (const { event, table } of Array.isArray(events) ? events : [events]) {
       const payload = JSON.stringify(event);
@@ -261,8 +310,8 @@ const BulkerDestination: JitsuFunction<AnalyticsServerEvent, BulkerDestinationCo
         );
       }
       const headers = { Authorization: `Bearer ${authToken}`, metricsMeta: JSON.stringify(metricsMeta) };
-      if (streamOptions && Object.keys(streamOptions).length > 0) {
-        headers["streamOptions"] = JSON.stringify(streamOptions);
+      if (effectiveStreamOptions && Object.keys(effectiveStreamOptions).length > 0) {
+        headers["streamOptions"] = JSON.stringify(effectiveStreamOptions);
       }
       let res: Awaited<ReturnType<typeof request>> | undefined;
       try {

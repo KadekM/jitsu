@@ -16,11 +16,14 @@ import JuneDestination from "./functions/june-destination";
 import SegmentDestination from "./functions/segment-destination";
 import AmplitudeDestination from "./functions/amplitude-destination";
 import FacebookConversionsApi from "./functions/facebook-conversions";
+import GoogleAdsDestination from "./functions/google-ads-destination";
 import IntercomDestination from "./functions/intercom-destination";
 import HubspotDestination from "./functions/hubspot-destination";
 import BrazeDestination from "./functions/braze-destination";
 import SalesforceDestination from "./functions/salesforce-destination";
 import StatsigDestination from "./functions/statsig-destination";
+import ResendDestination from "./functions/resend-destination";
+import SendgridDestination from "./functions/sendgrid-destination";
 
 const builtinDestinations: Record<BuiltinDestinationFunctionName, JitsuFunction> = {
   "builtin.destination.bulker": BulkerDestination as JitsuFunction,
@@ -35,14 +38,19 @@ const builtinDestinations: Record<BuiltinDestinationFunctionName, JitsuFunction>
   "builtin.destination.mongodb": MongodbDestination as JitsuFunction,
   "builtin.destination.amplitude": AmplitudeDestination as JitsuFunction,
   "builtin.destination.facebook-conversions": FacebookConversionsApi as JitsuFunction,
+  "builtin.destination.google-ads": GoogleAdsDestination as JitsuFunction,
   "builtin.destination.hubspot": HubspotDestination as JitsuFunction,
   "builtin.destination.salesforce": SalesforceDestination as JitsuFunction,
   "builtin.destination.statsig": StatsigDestination as JitsuFunction,
+  "builtin.destination.resend": ResendDestination as JitsuFunction,
+  "builtin.destination.sendgrid": SendgridDestination as JitsuFunction,
   "builtin.destination.devnull": () => undefined,
   "builtin.destination.tag": () => undefined,
   "builtin.destination.gtm": () => undefined,
   "builtin.destination.logrocket": () => undefined,
   "builtin.destination.ga4-tag": () => undefined,
+  "builtin.destination.clarity": () => undefined,
+  "builtin.destination.hotjar": () => undefined,
 } as const;
 
 const builtinTransformations: Record<BuiltinTransformationFunctionName, JitsuFunction> = {
@@ -67,6 +75,7 @@ export * as bulkerDestination from "./functions/bulker-destination";
 export { UserRecognitionParameter } from "./functions/user-recognition";
 export * as mixpanelDestination from "./functions/mixpanel-destination";
 export * as ga4Destination from "./functions/ga4-destination";
+export * as googleAdsDestination from "./functions/google-ads-destination";
 export * as webhookDestination from "./functions/webhook-destination";
 export * as posthogDestination from "./functions/posthog-destination";
 export * as mongodbDestination from "./functions/mongodb-destination";

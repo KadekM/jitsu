@@ -1,20 +1,21 @@
 import React, { ReactNode } from "react";
 import { useBilling } from "./BillingProvider";
+import { BannerCard } from "./BillingBanners";
 import { useAppConfig, useUser, useWorkspace } from "../../lib/context";
 import { useEeApi, useEeRedirect } from "../../lib/eeApi";
 import { assertDefined, assertFalse, assertTrue, requireDefined, rpc } from "juava";
 import { BillingSettings } from "../../lib/schema";
 import { Alert, Button, Progress, Skeleton, Tooltip } from "antd";
 import Link from "next/link";
-import { Check, ChevronRight, Edit2, ExternalLink, Info, XCircle } from "lucide-react";
+import { Check, ChevronRight, Edit2, Info, XCircle } from "lucide-react";
 
 import styles from "./BillingManager.module.css";
 import { useQuery } from "@tanstack/react-query";
 import { ErrorCard } from "../GlobalError/GlobalError";
 import { useEventsUsage } from "./use-events-usage";
-import { upgradeRequired } from "./copy";
 import { JitsuButton } from "../JitsuButton/JitsuButton";
 import dayjs from "dayjs";
+import { commitmentLabel } from "./charge-cadence";
 
 function formatNumber(n: number) {
   return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -62,7 +63,6 @@ const ComparisonSection: React.FC<{
 const EventsUsageSection: React.FC<{}> = () => {
   const billing = useBilling();
   const workspace = useWorkspace();
-  const eeRedirect = useEeRedirect();
   assertTrue(billing.enabled);
   assertFalse(billing.loading, "Billing must be loaded before using UsageSection component");
 
@@ -76,11 +76,6 @@ const EventsUsageSection: React.FC<{}> = () => {
 
   assertDefined(usage, "Data should be defined");
 
-  const usageExceeded = usage.usagePercentage > 1 && billing.settings.planId === "free";
-  const usageIsAboutToExceed =
-    usage?.projectionByTheEndOfPeriod &&
-    usage?.projectionByTheEndOfPeriod > usage?.maxAllowedDestinatonEvents &&
-    billing.settings.planId == "free";
   return (
     <div>
       <Progress
@@ -92,8 +87,10 @@ const EventsUsageSection: React.FC<{}> = () => {
         <div>
           {formatNumber(Math.round(usage?.events))} / {formatNumber(usage.maxAllowedDestinatonEvents)} destination
           events used from <i>{dayjs(usage.periodStart).utc().format("MMM DD, YYYY")}</i> to{" "}
-          <i>{dayjs(usage.periodEnd).utc().format("MMM DD, YYYY")}</i>. The quota will be reset on{" "}
-          <i>{dayjs(usage.periodEnd).add(1, "day").utc().format("MMM DD")}</i>.
+          {/* periodEnd is the exclusive end of the period (= the reset instant); the
+              usage window's last included day is one millisecond before it */}
+          <i>{dayjs(usage.periodEnd).subtract(1, "millisecond").utc().format("MMM DD, YYYY")}</i>. The quota will be
+          reset on <i>{dayjs(usage.periodEnd).utc().format("MMM DD")}</i>.
           <br />
           {billing?.settings?.overagePricePer100k && (
             <div className="text-textLight text-xs">
@@ -102,9 +99,11 @@ const EventsUsageSection: React.FC<{}> = () => {
           )}
         </div>
         <Link
-          href={`/${
-            workspace.slugOrId
-          }/settings/billing/details?start=${usage.periodStart.toISOString()}&end=${usage.periodEnd.toISOString()}`}
+          href={`/${workspace.slugOrId}/settings/billing/details?start=${usage.periodStart.toISOString()}&end=${dayjs(
+            usage.periodEnd
+          )
+            .subtract(1, "millisecond")
+            .toISOString()}`}
           className="flex items-center text-primary"
         >
           View detailed stat
@@ -112,74 +111,6 @@ const EventsUsageSection: React.FC<{}> = () => {
         </Link>
       </div>
 
-      {billing.settings?.pastDue && (
-        <div className="mt-8">
-          <Alert
-            message={<h4>You have unpaid invoices!</h4>}
-            description={
-              <div>
-                Please{" "}
-                <a
-                  className="cursor-pointer"
-                  onClick={() =>
-                    eeRedirect("billing/manage", { workspaceId: workspace.id, returnUrl: window.location.href })
-                  }
-                >
-                  <span className="inline-flex items-center space-x-1">
-                    <span>update your payment method and pay outstanding invoices</span>
-                    <ExternalLink className="w-5 h-5" />
-                  </span>
-                </a>{" "}
-                to avoid service interruption
-              </div>
-            }
-            type="error"
-            showIcon
-          />
-        </div>
-      )}
-      {usageExceeded && (
-        <div className="mt-8">
-          <Alert
-            message={<h4 className="text-xl">Upgrade your plan to keep using Jitsu</h4>}
-            description={<div className="text-lg">{upgradeRequired}</div>}
-            type="error"
-            showIcon
-          />
-        </div>
-      )}
-      {throttle && (
-        <div className="mt-8">
-          <Alert
-            message={<h4 className="font-bold">Throttling warning</h4>}
-            description={
-              <div>
-                You have repeatedly exceeded your monthly events destination limit, so you're incoming events are
-                throttled at rate of <b>{throttle}%</b> events per second. It means that only <b>{100 - throttle}%</b>{" "}
-                of incoming events are processed. Please upgrade your plan to restore the full processing capacity.
-              </div>
-            }
-            type="error"
-            showIcon
-          />
-        </div>
-      )}
-      {usageIsAboutToExceed && !usageExceeded && !throttle ? (
-        <div className="mt-8">
-          <Alert
-            message={<h4 className="font-bold">Account quota warning!</h4>}
-            showIcon
-            type={"warning"}
-            description={
-              <>
-                You are projected to exceed your monthly events destination limit by{" "}
-                <b>{formatNumber((usage?.projectionByTheEndOfPeriod || 0) - usage?.maxAllowedDestinatonEvents)}</b>{" "}
-                events. Please upgrade your plan to avoid service disruption.
-              </>
-            }
-          />
-        </div>
-      ) : undefined}
       {usage.usagePercentage > 1 && billing.settings.planId !== "free" && !throttle && (
         <div className="mt-8">
           <Alert
@@ -231,7 +162,9 @@ const ConnectorUsageSection: React.FC<{}> = () => {
     periodStart = new Date(billing.settings?.currentPeriod.start);
   } else {
     periodStart = dayjs().utc().startOf("month").toDate();
-    periodEnd = dayjs().utc().endOf("month").add(-1, "millisecond").toDate();
+    // Exclusive end (start of next month), matching the billing API's convention
+    // so this fallback path renders the same way as a real currentPeriod.
+    periodEnd = dayjs().utc().startOf("month").add(1, "month").toDate();
   }
   const { isLoading, error, data } = useQuery(
     ["connector usage", workspace.id],
@@ -263,8 +196,9 @@ const ConnectorUsageSection: React.FC<{}> = () => {
         <div>
           {activeSyncs} / {maxActiveSyncs} monthly active syncs from{" "}
           <i>{dayjs(periodStart).utc().format("MMM DD, YYYY")}</i> to{" "}
-          <i>{dayjs(periodEnd).utc().format("MMM DD, YYYY")}</i>. The quota will be reset on{" "}
-          <i>{dayjs(periodEnd).add(1, "day").utc().format("MMM DD")}</i>.
+          {/* periodEnd is exclusive (= the reset instant); the last included day is 1ms before */}
+          <i>{dayjs(periodEnd).subtract(1, "millisecond").utc().format("MMM DD, YYYY")}</i>. The quota will be reset on{" "}
+          <i>{dayjs(periodEnd).utc().format("MMM DD")}</i>.
           {billing?.settings?.dailyActiveSyncsOverage && (
             <div className="text-textLight text-xs">
               Overage fee: ${billing?.settings?.dailyActiveSyncsOverage} per extra daily active sync
@@ -339,8 +273,20 @@ const CurrentSubscription: React.FC<{}> = () => {
                 <div className="text-error">Cancels at</div>
               )}
               <div className="ml-2 rounded-3xl bg-textDark text-backgroundLight px-3 py-1 text-sm">
-                {dayjs(billing.settings?.expiresAt as string).format("MMMM DD, YYYY")}
+                {/* expiresAt is a UTC instant (a contract anniversary at 00:00 UTC on a
+                    committed plan); the local zone would show the previous day west of UTC,
+                    and every other period date on this page is already rendered in UTC */}
+                {dayjs(billing.settings?.expiresAt as string)
+                  .utc()
+                  .format("MMMM DD, YYYY")}
               </div>
+              {/* on a committed contract expiresAt is the end of the term, not of the
+                  monthly metering period — say so, or the date reads as a monthly cycle */}
+              {commitmentLabel(billing.settings.commitmentInterval) && (
+                <div className="ml-2 text-textLight text-sm">
+                  ({commitmentLabel(billing.settings.commitmentInterval)})
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -353,6 +299,20 @@ const CurrentSubscription: React.FC<{}> = () => {
           <ConnectorUsageSection />
         </>
       )}
+      {/* Billing banners from billing/settings, nested compact under the last
+          usage section: no extra widget zone (the sections' own charts cover
+          usage) and no action (it would navigate to this very page). Only
+          banners the server moved off the top strip (onBillingPage: false) —
+          default-visible ones already show there. Modal payloads (e.g.
+          past-due escalated) render as compact cards too: this page
+          suppresses blocking modals but must still inform. */}
+      {(billing.settings?.banners ?? [])
+        .filter(banner => banner.onBillingPage === false)
+        .map(banner => (
+          <div key={banner.id} className="mt-3">
+            <BannerCard banner={banner} compact />
+          </div>
+        ))}
     </div>
   );
 };

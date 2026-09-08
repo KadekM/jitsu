@@ -107,7 +107,8 @@ func newAbstractStream(id string, p SQLAdapter, tableName string, mode bulker.Bu
 		ps.schemaFromOptions = ps.sqlAdapter.TableHelper().MapSchema(ps.sqlAdapter, schema, ps.nameTransformer)
 		notFlatteningKeys := types2.NewSet[string]()
 		for _, field := range schema.Fields {
-			notFlatteningKeys.Put(field.Name)
+			// _mapForDwh compares name-transformed key paths (e.g. uppercased for Snowflake)
+			notFlatteningKeys.Put(ps.nameTransformer(field.Name))
 		}
 		ps.notFlatteningKeys = notFlatteningKeys
 	}
@@ -136,6 +137,7 @@ func (ps *AbstractSQLStream) preprocess(object types.Object, skipTypeHints bool)
 		if err != nil {
 			return nil, nil, err
 		}
+		sqlTypesHints = filterSQLTypesHints(ps.sqlAdapter.Type(), sqlTypesHints)
 	}
 	if len(ps.customTypes) > 0 {
 		if sqlTypesHints == nil {

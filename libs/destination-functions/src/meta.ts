@@ -29,8 +29,21 @@ export const FacebookConversionApiCredentialsUi = {
 
 export type FacebookConversionApiCredentials = z.infer<typeof FacebookConversionApiCredentials>;
 
+function isSupportedWebhookUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.username === "" && url.password === "";
+  } catch {
+    return false;
+  }
+}
+
 export const WebhookDestinationConfig = z.object({
-  url: z.string().url().describe("Webhook URL"),
+  url: z
+    .string()
+    .url()
+    .refine(isSupportedWebhookUrl, "Webhook URL must use HTTP or HTTPS without embedded credentials")
+    .describe("Webhook URL"),
   method: z
     .enum(["GET", "POST", "PUT", "DELETE"])
     .default("POST")
@@ -46,6 +59,41 @@ export const WebhookDestinationConfig = z.object({
     .optional()
     .describe(
       "Payload Template::Template for the webhook payload. The following macros are supported:<ul><li><code>{{ EVENT }}</code> - event json object for stream mode or batches with size=1</li><li><code>{{ EVENTS }}</code> - for batch mode - json array of events</li><li><code>{{ EVENTS_COUNT }}</code> - count of events in batch</li><li><code>{{ NAME }}</code> - event name</li><li><code>{{ env.VAR_NAME }}</code> - value of VAR_NAME environment variable</li></ul>"
+    ),
+  signatureMethod: z
+    .enum(["none", "hmac", "ed25519"])
+    .optional()
+    .default("none")
+    .describe(
+      "Signature Method::How outgoing requests are signed so your endpoint can verify them.<ul><li><code>none</code> — requests are not signed.</li><li><code>hmac</code> — symmetric HMAC-SHA256 with a shared secret (like Stripe/GitHub). Simple, but anyone who can verify can also forge, so only use it for endpoints you fully trust.</li><li><code>ed25519</code> — asymmetric signature. Jitsu signs with a private key; your endpoint verifies with the public key and cannot forge messages. Prefer this when many or untrusted endpoints receive the webhook.</li></ul><b>Note:</b> signing applies to <b>stream</b>-mode delivery only. In <b>batch</b> mode events are delivered by Bulker and are <b>not</b> signed — use stream mode if you need signed webhooks."
+    ),
+  signatureSecret: z
+    .string()
+    .optional()
+    .describe(
+      "Signing Secret::Shared secret for <code>HMAC-SHA256</code> signing (symmetric — there is no key pair). Put the <b>same</b> value here and in your receiving endpoint. Generate a random one with <code>openssl rand -hex 32</code> (any high-entropy string of 32+ bytes works). To verify a request, your endpoint recomputes the HMAC over the signed payload with this secret and compares the hex digest to the <code>Jitsu-Signature</code> header using a constant-time comparison. Keep it secret."
+    ),
+  signaturePrivateKey: z
+    .string()
+    .optional()
+    .describe(
+      "Private Key (PEM)::Ed25519 private key used to sign requests. Generate a key pair:<br/><code>openssl genpkey -algorithm ed25519 -out jitsu_private.pem</code><br/><code>openssl pkey -in jitsu_private.pem -pubout -out jitsu_public.pem</code><br/>Paste the contents of <code>jitsu_private.pem</code> here and install <code>jitsu_public.pem</code> on your endpoint. To verify a request, your endpoint checks the <code>Jitsu-Signature</code> header (a hex Ed25519 signature) against the signed payload using the public key. Jitsu holds only the private key — keep it secret; the public key is safe to distribute."
+    ),
+  signatureHeader: z
+    .string()
+    .regex(
+      /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/,
+      "Must be a valid HTTP header name (letters, digits, and !#$%&'*+-.^_`|~ only)"
+    )
+    .optional()
+    .default("Jitsu-Signature")
+    .describe("Signature Header::Name of the header carrying the signature. Only used when signing is enabled."),
+  signatureIncludeTimestamp: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      "Replay Protection::When enabled (recommended), the request timestamp (unix seconds) is folded into the signed payload — the signature covers <code>&lt;timestamp&gt;.&lt;body&gt;</code> — and sent in a companion <code>&lt;Signature Header&gt;-Timestamp</code> header. Your endpoint can then reject requests with an old timestamp to block replays of a captured, still-valid request. When disabled, only the raw body is signed and no timestamp header is sent: simpler to verify, but a captured request stays valid forever. Only used when signing is enabled."
     ),
 });
 
@@ -147,6 +195,91 @@ export const JuneCredentials = z.object({
 });
 export type JuneCredentials = z.infer<typeof JuneCredentials>;
 
+export const ResendCredentials = z.object({
+  apiKey: z
+    .string()
+    .describe(
+      `API Key::Create an API key in the Resend dashboard under "API Keys". It needs write access to Contacts. The key starts with "re_".`
+    ),
+  audiences: z
+    .string()
+    .optional()
+    .describe(
+      `Audiences::Comma-separated list of Resend audience names to add identified contacts to (e.g. <code>Customers, Beta</code>). Names are resolved automatically — any that don't exist yet are created. Leave empty to add contacts without an audience. Can be overridden per event with a <code>resendAudiences</code> trait. Membership is reconciled to match the list: audiences the connector previously added that are no longer listed get removed.`
+    ),
+  resolveEmailFromUserId: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      `Resolve email from userId::Resend identifies contacts by email only — it has no notion of a userId. When enabled, every <code>identify()</code> caches a userId → email mapping so later <code>track</code>/<code>page</code>/<code>group</code> events that carry only a userId can still update the matching contact. When disabled (default), only events that carry an email directly are matched; events with just a userId are skipped.`
+    ),
+  apiBase: z
+    .string()
+    .optional()
+    .describe(
+      `API Base URL::Override the Resend API base URL (defaults to https://api.resend.com). For testing or proxying.`
+    ),
+});
+export type ResendCredentials = z.infer<typeof ResendCredentials>;
+
+export const ResendCredentialsUi: Partial<
+  Record<keyof ResendCredentials, { documentation?: string; password?: boolean; hidden?: boolean }>
+> = {
+  apiKey: {
+    password: true,
+  },
+  apiBase: {
+    hidden: true,
+  },
+};
+
+export const SendgridCredentials = z.object({
+  apiKey: z
+    .string()
+    .describe(
+      `API Key::Create an API key in the SendGrid dashboard under Settings > API Keys. It needs "Marketing" permissions (Read/Write access to Marketing Contacts).`
+    ),
+  lists: z
+    .string()
+    .optional()
+    .describe(
+      `Lists::Comma-separated list of SendGrid marketing list names to add identified contacts to (e.g. <code>Customers, Beta</code>). Names are resolved automatically — any that don't exist yet are created. Leave empty to add contacts without a list. Can be overridden per event with a <code>sendgridLists</code> trait. Membership is reconciled to match the list: lists the connector previously added that are no longer listed get removed.`
+    ),
+  region: z
+    .enum(["Global", "EU"])
+    .optional()
+    .default("Global")
+    .describe(
+      `Data Residency::Select "EU" if your SendGrid account uses EU data residency (requests go to api.eu.sendgrid.com). Otherwise leave as "Global" (api.sendgrid.com).`
+    ),
+  resolveEmailFromUserId: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      `Resolve email from userId::SendGrid identifies contacts by email. When enabled, every <code>identify()</code> caches a userId → email mapping so later <code>track</code>/<code>page</code>/<code>group</code> events that carry only a userId can still update the matching contact. When disabled (default), only events that carry an email directly are matched.`
+    ),
+  apiBase: z
+    .string()
+    .optional()
+    .describe(
+      `API Base URL::Override the SendGrid API base URL (defaults to the Global/EU host from Data Residency). For testing or proxying.`
+    ),
+});
+export type SendgridCredentials = z.infer<typeof SendgridCredentials>;
+
+export const SendgridCredentialsUi: Partial<
+  Record<keyof SendgridCredentials, { documentation?: string; password?: boolean; hidden?: boolean }>
+> = {
+  apiKey: {
+    password: true,
+  },
+  apiBase: {
+    hidden: true,
+  },
+};
+
 export const SalesforceCredentials = z.object({
   authorized: z.boolean().optional().default(false),
   oauthIntegrationId: z.string().optional().default("jitsu-cloud-dst-salesforce"),
@@ -203,8 +336,14 @@ export const BrazeCredentials = z.object({
 });
 export type BrazeCredentials = z.infer<typeof BrazeCredentials>;
 
+const SEGMENT_API_BASES = [
+  "https://api.segmentapis.com/v1",
+  "https://eu1.api.segmentapis.com/v1",
+  "https://api.segment.io/v1",
+] as const;
+
 export const SegmentCredentials = z.object({
-  apiBase: z.string().default("https://api.segment.io/v1").describe("API Base::Segment API Base"),
+  apiBase: z.enum(SEGMENT_API_BASES).default(SEGMENT_API_BASES[0]).describe("API Base::Segment API Base"),
   writeKey: z
     .string()
     .describe(
@@ -355,16 +494,129 @@ export const Ga4Credentials = z.object({
       "The measurement ID associated with a stream.<br/><b>For Web:</b> found in the Google Analytics UI under: " +
         "<b>Admin > Data Streams > choose your stream > Measurement ID</b><br/><b>For Apps</b>: the Firebase App ID, found in the Firebase console under: <b>Project Settings > General > Your Apps > App ID</b>"
     ),
-  url: z
-    .string()
-    .url()
-    .describe(
-      "Measurement Protocol URL.<br/>Default: <code>https://www.google-analytics.com/mp/collect</code><br/>Default debug url: <code>https://www.google-analytics.com/debug/mp/collect</code>"
-    )
-    .default("https://www.google-analytics.com/mp/collect"),
   events: z.string().optional().default("").describe(eventsParamDescription),
 });
 export type Ga4Credentials = z.infer<typeof Ga4Credentials>;
+
+export const GoogleAdsCredentials = z.object({
+  // Filled in by the Nango "Authorize" button in the console, hidden in the UI. Same shape as
+  // SalesforceCredentials above.
+  authorized: z.boolean().optional().default(false),
+  oauthIntegrationId: z.string().optional().default("jitsu-cloud-dst-google-ads"),
+  oauthConnectionId: z.string().optional(),
+
+  api: z
+    .enum(["data-manager", "google-ads"])
+    .default("data-manager")
+    .describe(
+      "API::Which Google API to send conversions to." +
+        "<ul>" +
+        "<li><b>data-manager</b> — the <a href='https://developers.google.com/data-manager/api' target='_blank' rel='noreferrer noopener'>Data Manager API</a>. Recommended, and the only option for accounts onboarded after June 15, 2026.</li>" +
+        "<li><b>google-ads</b> — the legacy <code>UploadClickConversions</code> endpoint of the Google Ads API. Requires an approved developer token, and Google no longer accepts new accounts for it. Pick this only if your account is already allowlisted.</li>" +
+        "</ul>"
+    ),
+
+  customerId: z
+    .string()
+    .describe(
+      "Customer ID::Your Google Ads account ID — 10 digits, found in the top right of the Google Ads UI. Dashes are optional."
+    ),
+  loginCustomerId: z
+    .string()
+    .optional()
+    .default("")
+    .describe(
+      "Manager (MCC) Customer ID::Set this when a manager account is used to access the account above. Leave empty if you authorized directly with the account."
+    ),
+
+  conversionType: z
+    .enum(["conversion", "enhancement"])
+    .default("conversion")
+    .describe(
+      "Conversion Type::What kind of upload this destination performs." +
+        "<ul>" +
+        "<li><b>conversion</b> — report new conversions. Covers offline click conversions (matched on <code>gclid</code>) and <i>Enhanced Conversions for Leads</i> (matched on hashed user data). Requires a conversion action of type <b>Upload from clicks</b>.</li>" +
+        "<li><b>enhancement</b> — <i>Enhanced Conversions for Web</i>. Does not create conversions; it attaches hashed user data to conversions your Google tag already recorded on the site, matched by <b>order ID</b>. Requires a conversion action of type <b>Website</b>, and every event must carry an order ID.</li>" +
+        "</ul>"
+    ),
+
+  conversionActionId: z
+    .string()
+    .describe(
+      "Conversion Action ID::The numeric ID of the Google Ads conversion action that receives events with no per-event override. Find it in the URL when you open the conversion action under <b>Goals » Conversions » Summary</b>."
+    ),
+  conversionActions: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Per-event Conversion Actions::Route individual events to different conversion actions. One <code>eventName=conversionActionId</code> per line, e.g. <code>Order Completed=111222333</code>. Events not listed here use the Conversion Action ID above."
+    ),
+  events: z.string().optional().default("").describe(eventsParamDescription),
+
+  eventSource: z
+    .enum(["WEB", "APP", "IN_STORE", "PHONE", "MESSAGE", "OTHER"])
+    .default("WEB")
+    .describe(
+      "Event Source::Where the conversion happened. The legacy Google Ads API only understands <code>WEB</code> and <code>APP</code>; other values are omitted from that payload."
+    ),
+  phoneFieldName: z
+    .string()
+    .optional()
+    .default("")
+    .describe(
+      "Phone Trait Name::Name of the field in the event user traits holding the phone number. It is normalized to <a href='https://en.wikipedia.org/wiki/E.164' target='_blank' rel='noreferrer noopener'>E.164</a> and hashed before sending. If empty, no phone number is sent."
+    ),
+  defaultPhoneCountryCode: z
+    .string()
+    .optional()
+    .default("")
+    .describe(
+      "Default Phone Country Code::Prepended to phone numbers that don't already start with <code>+</code>, e.g. <code>+1</code>. Google rejects phone numbers that aren't in E.164 format, so set this if your traits store local numbers."
+    ),
+
+  developerToken: z
+    .string()
+    .optional()
+    .describe(
+      "Developer Token::Used by the legacy Google Ads API only, and normally left empty — a developer token identifies the application calling the API rather than your advertiser account, so Jitsu supplies one. Fill this in only if you have your own token and want it used instead. You can request one under <b>API Center</b> in your Google Ads manager account."
+    ),
+
+  storeClickIds: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      "Remember Click IDs::Jitsu watches every event on this connection for a <code>gclid</code>/<code>gbraid</code>/<code>wbraid</code> and remembers it against the anonymous user for 90 days, so a conversion that fires later still gets attributed. Turn this off to only use click ids present on the converting event itself."
+    ),
+  validateOnly: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Validate Only::Send requests with Google's <code>validateOnly</code> flag. Google checks the payload and reports errors but records nothing. Useful to verify a new setup without polluting conversion data."
+    ),
+});
+
+export const GoogleAdsCredentialsUi = {
+  authorized: {
+    hidden: true,
+  },
+  oauthIntegrationId: {
+    hidden: true,
+  },
+  oauthConnectionId: {
+    hidden: true,
+  },
+  conversionActions: {
+    editor: "StringArrayEditor",
+  },
+  developerToken: {
+    password: true,
+    hidden: (obj: any) => obj.api !== "google-ads",
+  },
+};
+
+export type GoogleAdsCredentials = z.infer<typeof GoogleAdsCredentials>;
 
 export const HubspotCredentials = z.object({
   accessToken: z

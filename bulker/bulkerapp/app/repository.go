@@ -89,6 +89,9 @@ func (r *Repository) init() error {
 	metrics.RepositoryDestinations("added").Add(float64(len(repositoryChange.AddedDestinations)))
 	metrics.RepositoryDestinations("changed").Add(float64(len(repositoryChange.ChangedDestinations)))
 	metrics.RepositoryDestinations("removed").Add(float64(len(repositoryChange.RemovedDestinationIds)))
+	// live repository size (JITSU-191): internal.destinations is the full set
+	// just stored — unchanged copies + added + changed, minus removed.
+	metrics.RepositoryDestinationsCurrent.Set(float64(len(internal.destinations)))
 	select {
 	case r.changesChan <- repositoryChange:
 	default:
@@ -224,6 +227,11 @@ func (d *Destination) TopicId(tableName, modeOverride, prefix string, partition 
 // Id returns destination id
 func (d *Destination) Id() string {
 	return d.config.Id()
+}
+
+// WorkspaceId returns id of workspace that owns the destination. Empty for special and env-configured destinations
+func (d *Destination) WorkspaceId() string {
+	return d.config.WorkspaceId
 }
 
 func (d *Destination) InitBulkerInstance() {

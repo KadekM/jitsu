@@ -75,7 +75,10 @@ export const createInMemoryStore = <T>(definition: StoreDefinition<T>): InMemory
           status = "ok";
           lastRefresh = new Date();
         } catch (e) {
-          log.atWarn().withCause(e).log(`Failed to refresh store ${definition.name}. Using an old value`);
+          // Not a system error (the store keeps serving the old value) — but the message
+          // wording matches the Go-side repository refresh error in bulker/jitsubase so
+          // one log query covers both stacks
+          log.atError().withCause(e).log(`Error refreshing repository ${definition.name}. Using an old value`);
           status = "outdated";
         }
       };
@@ -109,6 +112,13 @@ export const createInMemoryStore = <T>(definition: StoreDefinition<T>): InMemory
         const cachedInstance = loadFromCache(definition);
         if (!cachedInstance) {
           status = "failed";
+          log
+            .atError()
+            .log(
+              `System error: Failed to initialize store ${definition.name}. Initial load failed with ${getErrorMessage(
+                e
+              )} and no local cache found`
+            );
           reject(
             new Error(
               `Failed to initialize store ${definition.name}. Initial load failed with ${getErrorMessage(

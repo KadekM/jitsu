@@ -1,4 +1,4 @@
-import { createRoute, verifyAccess } from "../../../../../lib/api";
+import { createRoute, verifyAccess, verifyAccessWithRole } from "../../../../../lib/api";
 import { z } from "zod";
 import { db } from "../../../../../lib/server/db";
 import { requireDefined } from "juava";
@@ -46,9 +46,16 @@ export default createRoute()
         .workspace.findFirst({ where: { OR: [{ id: workspaceIdOrSlug }, { slug: workspaceIdOrSlug }] } }),
       `Workspace ${workspaceIdOrSlug} not found`
     );
-    await verifyAccess(user, workspace.id);
+    await verifyAccessWithRole(user, workspace.id, "editEntities");
     if (section == "data-retention") {
       (body as any).pendingUpdate = true;
+      // Not writable here (JITSU-143): backupRetentionHours drives the GCS
+      // event archive's retention enforcement — retention 0 drains the whole
+      // archive — and this endpoint merges the body unvalidated. Members set
+      // it through the dedicated, validated `backup-retention` route
+      // (JITSU-202); deleting it from the body preserves the stored value
+      // through the deep merge below.
+      delete (body as any).backupRetentionHours;
     }
     const existing = await db.prisma().workspaceOptions.findFirst({
       where: { workspaceId: workspace.id, namespace: section },

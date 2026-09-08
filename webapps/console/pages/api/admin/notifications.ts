@@ -1,3 +1,7 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument --
+ * Pre-existing implicit-`any` debt, exempted when the unsafe-any gate was
+ * introduced for pages/api/admin (JITSU-158 action item 3). Fix the `any`
+ * flows in this file, then remove this header - do not add new ones. */
 import { createRoute, verifyAdmin } from "../../../lib/api";
 import { clickhouse, dateToClickhouse } from "../../../lib/server/clickhouse";
 import { db } from "../../../lib/server/db";
@@ -113,6 +117,10 @@ function chKey(channelId: string, actorId: string, type: string, tableName?: str
 export default createRoute()
   .GET({
     auth: true,
+    // GET but writes heavily (StatusChange / NotificationState / Notification rows).
+    // The k8s CronJob will receive 503 during maintenance and skip; resumes when
+    // maintenance ends.
+    mutates: true,
     query: z.object({
       dryRun: z.string().optional(),
     }),

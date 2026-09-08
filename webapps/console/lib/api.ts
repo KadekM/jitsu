@@ -9,10 +9,13 @@ import { getServerSession, Session } from "next-auth";
 import { nextAuthConfig } from "./nextauth.config";
 import { inferTokenTypeFromId, SessionUser } from "./schema";
 import { db } from "./server/db";
+import { isMaintenanceActive, isReadOnly } from "./server/maintenance";
 import { prepareZodObjectForDeserialization, safeParseWithDate } from "./zod";
 import { ApiError } from "./shared/errors";
 import { getServerLog } from "./server/log";
+import { runWithRequestContext } from "./server/request-context";
 import { getFirebaseUser, isFirebaseEnabled } from "./server/firebase-server";
+import { randomUUID } from "crypto";
 import jwt from "jsonwebtoken";
 import { serialize } from "cookie";
 import {
@@ -70,6 +73,16 @@ export type ApiMethod<RequireAuth extends boolean = boolean, Res = any, Body = a
   // indicates that handler uses write method for outputting response content. This is useful for streaming responses.
   streaming?: boolean;
   rateLimit?: RouteRateLimitSpec;
+  // when true, the route is exempt from the maintenance-mode write block (e.g.
+  // auth, app-config, maintenance, healthcheck, and the admin maintenance endpoint)
+  allowDuringMaintenance?: boolean;
+  // Force the route to be treated as mutating for the maintenance-mode block,
+  // regardless of HTTP method. Use on GET routes that perform real DB writes
+  // (admin cron endpoints, etc.) so they're blocked just like POST/PUT/PATCH/DELETE.
+  // Don't use for handlers that do *incidental* writes during reads (e.g. updating
+  // a `lastUsed` timestamp) — those should remain non-mutating from the gate's
+  // perspective, with the write itself wrapped in try/catch by the caller.
+  mutates?: boolean;
   handle: (ctx: HandlerOpts<Body, Query, RequireAuth>) => Promise<Res>;
 };
 
@@ -267,7 +280,7 @@ export async function getUser(
   if (bearerToken) {
     const [keyId, secret] = bearerToken.split(":");
     if (!secret) {
-      throw new ApiError("Bearer token should have a format of keyId:secret");
+      throw new ApiError("Bearer token should have a format of keyId:secret", { status: 401 });
     }
     const serviceAccount = findServiceAccount({ keyId, secret });
     if (serviceAccount) {
@@ -277,19 +290,35 @@ export async function getUser(
       //auth based on an API key
       const token = await db.prisma().userApiToken.findUnique({ where: { id: keyId } });
       if (!token) {
-        throw new ApiError(`Invalid API key id ${keyId}`, { keyId }, { status: 401 });
+        throw new ApiError(`Invalid API key id ${keyId}`, { status: 401, responseObject: { keyId } });
       }
       if (!checkHash(token.hash, secret)) {
-        throw new ApiError(`Invalid API key secret for ${keyId}`, { keyId }, { status: 401 });
+        throw new ApiError(`Invalid API key secret for ${keyId}`, { status: 401, responseObject: { keyId } });
+      }
+      // MCP refresh tokens are stored in UserApiToken but must not be usable
+      // as general Console API bearer keys — they are scoped to MCP only.
+      if (token.oauthClientId) {
+        throw new ApiError(`MCP refresh tokens cannot be used as Console API bearer keys`, {
+          status: 401,
+          responseObject: { keyId },
+        });
       }
       if (token.expiresAt && token.expiresAt.getTime() < Date.now()) {
-        throw new ApiError(`API key ${keyId} has expired`, { keyId }, { status: 401 });
+        throw new ApiError(`API key ${keyId} has expired`, { status: 401, responseObject: { keyId } });
       }
       const user = requireDefined(
         await db.prisma().userProfile.findUnique({ where: { id: token.userId } }),
         `Can't find user ${token.userId} for API key ${keyId}`
       );
-      await db.prisma().userApiToken.update({ where: { id: keyId }, data: { lastUsed: new Date() } });
+      // Best-effort lastUsed bookkeeping — must never break auth. Read-only
+      // backstops (Prisma read-only extension or future DB-side restrictions)
+      // would reject this write; swallow the error so the read-path call still
+      // authenticates the user.
+      try {
+        await db.prisma().userApiToken.update({ where: { id: keyId }, data: { lastUsed: new Date() } });
+      } catch (e: any) {
+        log.atWarn().withCause(e).log(`Failed to bump lastUsed for API key ${keyId}`);
+      }
       return {
         internalId: user.id,
         externalUsername: user.externalUsername,
@@ -317,11 +346,40 @@ export async function getUser(
 }
 
 export function nextJsApiHandler(api: Api): NextApiHandler {
-  return async (req: NextApiRequest, res: NextApiResponse) => {
+  const handleRequest = async (req: NextApiRequest, res: NextApiResponse) => {
     const method = req.method as HttpMethodType;
     const handler = api[method];
     if (!handler) {
       res.status(405).json({ error: `${method} method not supported` });
+      return;
+    }
+    // Real read-only during maintenance: reject mutating requests at the API
+    // layer (the Prisma read-only extension is a further backstop). The gate
+    // treats a request as mutating if its HTTP method is POST/PUT/PATCH/DELETE
+    // OR the route explicitly opts in via `mutates: true` (for GET routes that
+    // actually write — admin cron endpoints, etc.). Routes that must keep
+    // working (auth, app-config, maintenance, healthcheck, admin maintenance
+    // toggle, read-only POSTs) opt out via `allowDuringMaintenance`.
+    //
+    // For `auth: true` routes, the gate runs *after* getUser so anonymous
+    // callers still see 401/403 with their original semantics and we don't
+    // leak maintenance state to unauthenticated probes (relevant when the
+    // descriptor sets `visible: false`).
+    const isMutatingMethod = method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+    const isMutating = isMutatingMethod || !!handler.mutates;
+    const writeBlocked = isMutating && !handler.allowDuringMaintenance && isReadOnly();
+    // Distinguish the two reasons writes are blocked. A time-boxed maintenance
+    // window keeps the maintenance-coded 503 the frontend renders a banner for.
+    // The permanent read-only switch (JITSU_CONSOLE_READ_ONLY — canary/preview
+    // deployments, JITSU-159) must NOT masquerade as maintenance: there is no
+    // window to "end", and mislabeling it skews clients and alerting. It just
+    // rejects the write plainly.
+    const writeBlockedResponse = () =>
+      isMaintenanceActive()
+        ? { error: "maintenance", message: "Jitsu is in maintenance mode; modifications are temporarily disabled." }
+        : { error: "read_only", message: "This Jitsu deployment is read-only; modifications are disabled." };
+    if (writeBlocked && !handler.auth) {
+      res.status(503).json(writeBlockedResponse());
       return;
     }
     let currentUser: SessionUser | undefined = undefined;
@@ -332,6 +390,12 @@ export function nextJsApiHandler(api: Api): NextApiHandler {
         currentUser = await getUser(res, req);
         if (!currentUser) {
           res.status(401).send({ error: "Authorization Required" });
+          return;
+        }
+        // Auth-required routes only learn about the write block *after* successful
+        // auth — see the rationale above.
+        if (writeBlocked) {
+          res.status(503).json(writeBlockedResponse());
           return;
         }
       }
@@ -380,8 +444,10 @@ export function nextJsApiHandler(api: Api): NextApiHandler {
 
         if (!parseResult.success) {
           throw new ApiError(`Can't parse request body for ${req.method} ${req.url}`, {
-            zodError: parseResult.error,
-            body: tryJson(req.body),
+            responseObject: {
+              zodError: parseResult.error,
+              body: tryJson(req.body),
+            },
           });
         }
         body = parseResult.data;
@@ -390,7 +456,9 @@ export function nextJsApiHandler(api: Api): NextApiHandler {
           body = parseIfNeeded(req.body);
         } catch (e) {
           throw new ApiError(`Body ${req.method} ${req.url} is not a JSON object: ${getErrorMessage(e)}`, {
-            body: req.body,
+            responseObject: {
+              body: req.body,
+            },
           });
         }
       }
@@ -399,7 +467,9 @@ export function nextJsApiHandler(api: Api): NextApiHandler {
         const parseResult = safeParseWithDate(handler.types?.query, req.query);
         if (!parseResult.success) {
           throw new ApiError(`Can't parse request query for ${req.method} ${req.url}`, {
-            zodError: parseResult.error,
+            responseObject: {
+              zodError: parseResult.error,
+            },
           });
         }
         query = parseResult.data;
@@ -425,7 +495,9 @@ export function nextJsApiHandler(api: Api): NextApiHandler {
               )}. Zod error: ${JSON.stringify(parseResult.error)}`
             );
           throw new ApiError(`Response for ${req.method} ${req.url} doesn't match required schema`, {
-            zodError: parseResult.error,
+            responseObject: {
+              zodError: parseResult.error,
+            },
           });
         }
         //do not set explicit 200 status here. If the status has been set by the handler, we should respect it. There's
@@ -462,6 +534,17 @@ export function nextJsApiHandler(api: Api): NextApiHandler {
           .send({ error: tryJson(getErrorMessage(e)), details: e?.stack, stackArray: stackToArray(e?.stack) });
       }
     }
+  };
+  return async (req: NextApiRequest, res: NextApiResponse) => {
+    // Bind the inbound nginx X-Request-ID (or a generated fallback) to the async
+    // context so every log line for this request carries request_id → @request_id
+    // in Datadog, enabling an exact edge-5xx ↔ app-stack join (JITSU-104).
+    const rawRequestId = req.headers["x-request-id"];
+    const headerRequestId = Array.isArray(rawRequestId) ? rawRequestId[0] : rawRequestId;
+    // trim() so a blank/whitespace header falls back to a real id instead of
+    // collapsing distinct requests under an empty-ish @request_id.
+    const requestId = headerRequestId?.trim() || randomUUID();
+    return runWithRequestContext({ request_id: requestId }, () => handleRequest(req, res));
   };
 }
 
@@ -521,11 +604,10 @@ export async function verifyAccess(user: SessionUser, workspaceId: string) {
     if ((await db.prisma().userProfile.findFirst({ where: { id: user.internalId } }))?.admin) {
       return;
     }
-    throw new ApiError(
-      `User ${userId} doesn't have access to workspace ${workspaceId}`,
-      { workspaceId, userId },
-      { status: 403 }
-    );
+    throw new ApiError(`User ${userId} doesn't have access to workspace ${workspaceId}`, {
+      status: 403,
+      responseObject: { workspaceId, userId },
+    });
   }
 }
 
@@ -561,11 +643,10 @@ export async function verifyAccessWithRole(
         ...WorkspaceRolePermissions["owner"],
       };
     }
-    throw new ApiError(
-      `User ${userId} doesn't have access to workspace ${workspaceId}`,
-      { workspaceId, userId },
-      { status: 403 }
-    );
+    throw new ApiError(`User ${userId} doesn't have access to workspace ${workspaceId}`, {
+      status: 403,
+      responseObject: { workspaceId, userId },
+    });
   }
 
   const role = (access.role || "owner") as WorkspaceRoleType;
@@ -573,9 +654,33 @@ export async function verifyAccessWithRole(
   if (!hasPermission(role, requiredPermission)) {
     throw new ApiError(
       `User ${userId} doesn't have permission '${requiredPermission}' in workspace ${workspaceId}. Required role: owner or editor`,
-      { workspaceId, userId, role, requiredPermission },
-      { status: 403 }
+      { status: 403, responseObject: { workspaceId, userId, role, requiredPermission } }
     );
+  }
+
+  // A workspace carrying the `readonly` feature flag (set for billing
+  // enforcement, e.g. unpaid invoices — JITSU-123) rejects entity mutations at
+  // the API level; the UI lock alone is trivially bypassed with an API token.
+  // Reads stay open, and `manageUsers` deliberately stays role-gated only —
+  // inviting the teammate who holds the credit card must remain possible.
+  // Jitsu admins and service accounts bypass via the short-circuits above.
+  if (requiredPermission === "editEntities" || requiredPermission === "deleteEntities") {
+    const workspace = await db.prisma().workspace.findFirst({
+      where: { id: workspaceId },
+      select: { featuresEnabled: true },
+    });
+    if (workspace?.featuresEnabled?.includes("readonly")) {
+      // Jitsu admins bypass readonly even when they hold an explicit
+      // workspaceAccess row (the earlier short-circuit only covers admins
+      // without one).
+      const isAdmin = (await db.prisma().userProfile.findFirst({ where: { id: user.internalId } }))?.admin;
+      if (!isAdmin) {
+        throw new ApiError(
+          `Workspace is in read-only mode due to billing issues. Please resolve them on the billing page to restore access.`,
+          { status: 403, responseObject: { workspaceId, userId, role, requiredPermission, readonly: true } }
+        );
+      }
+    }
   }
 
   return {
@@ -603,6 +708,8 @@ export type RouteMethodSpec<
   resultExample?: any;
   expand?: ExpandSpec;
   rateLimit?: RouteRateLimitSpec;
+  allowDuringMaintenance?: boolean;
+  mutates?: boolean;
 };
 
 export type RouteBuilderBase = {
@@ -646,6 +753,8 @@ export function createRoute(): RouteBuilder {
             streaming: spec.streaming,
             description: spec.description,
             rateLimit: spec.rateLimit,
+            allowDuringMaintenance: spec.allowDuringMaintenance,
+            mutates: spec.mutates,
           };
           specByMethod[method] = {
             query: spec.query,

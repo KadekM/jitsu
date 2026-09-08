@@ -45,7 +45,7 @@ var eventTypesSet = types.NewSet("page", "identify", "track", "group", "alias", 
 
 var messageIdUnsupportedChars = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
-type eventPatchFunc func(c *gin.Context, messageId string, event types.Json, tp string, ingestType IngestType, analyticContext types.Json, defaultEventName string) error
+type eventPatchFunc func(c *gin.Context, messageId string, event types.Json, tp string, ingestType IngestType, analyticContext types.Json, defaultEventName string, stream *StreamWithDestinations) error
 
 type Router struct {
 	*appbase.Router
@@ -216,23 +216,25 @@ func NewRouter(appContext *Context, partitionSelector kafkabase.PartitionSelecto
 	return router
 }
 
+// CorsMiddleware serves the ingest API as an intentionally open, credential-less
+// endpoint: a constant wildcard origin and no Access-Control-Allow-Credentials.
+// Reflecting the Origin together with allow-credentials would let any site read
+// credentialed responses (JITSU-11); no supported client sends cookies here.
 func (r *Router) CorsMiddleware(c *gin.Context) {
 	origin := c.GetHeader("Origin")
 	if c.Request.Method == "OPTIONS" {
-		c.Header("Access-Control-Allow-Origin", utils.NvlString(origin, "*"))
+		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS")
 		// x-jitsu-custom - in case client want to add some custom payload via header
 		c.Header("Access-Control-Allow-Headers", "x-enable-debug, x-write-key, authorization, content-type, x-ip-policy, cache-control, x-jitsu-custom")
-		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Max-Age", "86400")
 		c.AbortWithStatus(http.StatusOK)
 		return
 	} else if origin != "" {
-		c.Header("Access-Control-Allow-Origin", origin)
+		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,HEAD,OPTIONS")
 		// x-jitsu-custom - in case client want to add some custom payload via header
 		c.Header("Access-Control-Allow-Headers", "x-enable-debug, x-write-key, authorization, content-type, x-ip-policy, cache-control, x-jitsu-custom")
-		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Max-Age", "86400")
 	}
 	c.Next()
@@ -302,7 +304,28 @@ func (r *Router) sendToRotor(c *gin.Context, messageId string, ingestMessageByte
 
 	if stream.Throttle > 0 {
 		if stream.Throttle >= 100 || rand.Int31n(100) < int32(stream.Throttle) {
-			rError = r.ResponseError(c, http.StatusPaymentRequired, ErrThrottledType, false, fmt.Errorf(ErrThrottledDescription), sendResponse, false, true)
+			if r.config.ErrorOnThrottle {
+				// Opt-in: surface the quota block as an HTTP 402 so the client
+				// sees the rejection (and it shows up in the client's own
+				// monitoring). ResponseError writes the error body itself.
+				rError = r.ResponseError(c, http.StatusPaymentRequired, ErrThrottledType, false, fmt.Errorf(ErrThrottledDescription), sendResponse, false, true)
+				return
+			}
+			// Quota block (JITSU-88), default: the event is accepted at ingest and
+			// already preserved in backup above, but is not delivered to
+			// destinations. Blocking is silent — respond success so the client
+			// sees no ingestion error. The returned throttle marker still drives
+			// the SKIPPED events-log status, the `throttled` metric and the
+			// dead-letter copy in the caller (constructed with sendResponse=false
+			// so it doesn't write the error body).
+			rError = r.ResponseError(c, http.StatusOK, ErrThrottledType, false, fmt.Errorf(ErrThrottledDescription), false, false, true)
+			if sendResponse {
+				if c.FullPath() == "/api/px/:tp" {
+					c.Data(http.StatusOK, "image/gif", appbase.EmptyGif)
+				} else {
+					c.JSON(http.StatusOK, gin.H{"ok": true})
+				}
+			}
 			return
 		}
 	}
@@ -333,7 +356,7 @@ func (r *Router) sendToRotor(c *gin.Context, messageId string, ingestMessageByte
 	return
 }
 
-func patchEvent(c *gin.Context, messageId string, ev types.Json, tp string, ingestType IngestType, analyticContext types.Json, defaultEventName string) error {
+func patchEvent(c *gin.Context, messageId string, ev types.Json, tp string, ingestType IngestType, analyticContext types.Json, defaultEventName string, stream *StreamWithDestinations) error {
 	typeFixed := utils.MapNVL(eventTypesDict, tp, tp)
 	if typeFixed == "event" {
 		if defaultEventName != "" {
@@ -399,9 +422,29 @@ func patchEvent(c *gin.Context, messageId string, ev types.Json, tp string, inge
 		ctx.SetIfAbsentFunc("locale", func() any {
 			return strings.TrimSpace(strings.Split(c.GetHeader("Accept-Language"), ",")[0])
 		})
+		// browser clients cannot read their own request headers and must not be able to
+		// spoof them: when header capture is enabled, always derive context.headers from
+		// the actual request, ignoring whatever the body provided; when disabled, drop a
+		// body-provided value for the same anti-spoofing reason.
+		if stream != nil && stream.CaptureHeaders {
+			ctx.Set("headers", buildContextHeaders(c, nil, ctx))
+		} else {
+			ctx.Delete("headers")
+		}
 		// remove any jitsu special properties from ingested events
 		// it is only allowed to be set via functions
 		types.FilterEvent(ev)
+	} else {
+		// server-to-server: capture the (forwarding) request headers, but let the caller
+		// override allow-listed headers via the event body to forward the original
+		// device's headers. When capture is disabled, a body-provided context.headers is
+		// left as-is — s2s callers hold the write key and control the event anyway.
+		if stream != nil && stream.CaptureHeaders {
+			ctx.Set("headers", buildContextHeaders(c, ctx.GetN("headers"), ctx))
+		}
+		// s2s callers may use __sql_type* hints (unlike browser, where FilterEvent
+		// drops them), but hint values reach SQL DDL — keep only type-shaped ones
+		types.SanitizeSqlTypes(ev)
 	}
 	nowIsoDate := time.Now().UTC().Format(timestamp.JsonISO)
 	ev.Set("receivedAt", nowIsoDate)
@@ -448,6 +491,104 @@ func (r *Router) getDataLocator(c *gin.Context, ingestType IngestType, writeKeyE
 func isInternalHeader(headerName string) bool {
 	l := strings.ToLower(headerName)
 	return strings.HasPrefix(l, "x-jitsu-") || strings.HasPrefix(l, "x-vercel")
+}
+
+// maskedHeaderValue replaces values of headers that are not allow-listed: the header's
+// presence is still a useful signal (e.g. for bot detection), but its value may carry
+// credentials (cookie, authorization, x-api-key, vendor JWTs, ...) and must not reach
+// destinations.
+const maskedHeaderValue = "***"
+
+// contextHeadersAllowlist are the client-meaningful headers whose values are copied into
+// event.context.headers as-is; any other header keeps only its name, with the value
+// masked. The same list gates which headers the event body may override on the s2s
+// endpoint (a server-side SDK forwarding the original device's headers).
+// The list is intentionally limited to standard content-negotiation, navigation and
+// client-hint headers that cannot carry credentials.
+var contextHeadersAllowlist = types.NewSet(
+	// content negotiation / request metadata
+	"accept", "accept-language", "accept-encoding", "content-type",
+	"user-agent", "referer", "origin", "host",
+	"cache-control", "pragma", "priority", "upgrade-insecure-requests", "x-requested-with",
+	// privacy signals
+	"dnt", "sec-gpc",
+	// Web Bot Auth (HTTP Message Signatures for bots/agents, draft-meunier-web-bot-auth):
+	// the value is the URL identifying the agent operator (e.g. "https://chatgpt.com") —
+	// the primary self-identification signal of AI agents. The companion "signature" /
+	// "signature-input" headers carry cryptographic material, not identity, and stay
+	// masked (their presence alone is the signal).
+	"signature-agent",
+	// fetch metadata (the strongest browser-vs-bot tell)
+	"sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user",
+	// user-agent client hints
+	"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-platform-version",
+	"sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-model", "sec-ch-ua-wow64",
+	"sec-ch-ua-full-version", "sec-ch-ua-full-version-list", "sec-ch-ua-form-factors",
+	// device / network client hints
+	"save-data", "device-memory", "dpr", "viewport-width", "width", "downlink", "ect", "rtt",
+)
+
+// buildContextHeaders captures all incoming HTTP request headers (lower-cased keys) for
+// event.context.headers. Internal (x-jitsu-*, x-vercel*) and __sql_type* headers are
+// dropped entirely; allow-listed headers keep their values, the write key is masked with
+// maskWriteKey, and every other header keeps its name but gets a masked value. Allow-listed
+// headers already present in the event body (bodyHeaders) win over the request headers.
+// Headers whose exact values the event already carries in their canonical context places
+// (context.userAgent, context.page.referrer, context.page.host) are removed as
+// redundant; a differing value is kept - the mismatch itself is a bot signal.
+func buildContextHeaders(c *gin.Context, bodyHeaders any, eventContext types.Json) map[string]string {
+	headers := make(map[string]string, len(c.Request.Header))
+	for k, v := range c.Request.Header {
+		lk := strings.ToLower(k)
+		// __sql_type* keys are dropped: headers bypass types.FilterEvent (plain map, not
+		// types.Json), and such a key would otherwise become a raw SQL type hint downstream.
+		if len(v) == 0 || isInternalHeader(k) || strings.HasPrefix(lk, types.SqlTypePrefix) {
+			continue
+		}
+		switch {
+		case lk == "x-write-key":
+			headers[lk] = maskWriteKey(v[0])
+		case contextHeadersAllowlist.Contains(lk):
+			headers[lk] = strings.Join(v, ",")
+		default:
+			headers[lk] = maskedHeaderValue
+		}
+	}
+	// net/http promotes the Host header into Request.Host - it never appears in the header map
+	if c.Request.Host != "" {
+		headers["host"] = c.Request.Host
+	}
+	overlay := func(k string, val any) {
+		lk := strings.ToLower(k)
+		if !contextHeadersAllowlist.Contains(lk) {
+			return
+		}
+		if s, ok := val.(string); ok {
+			headers[lk] = s
+		}
+	}
+	switch bh := bodyHeaders.(type) {
+	case types.Json:
+		bh.ForEach(overlay)
+	case map[string]any:
+		for k, val := range bh {
+			overlay(k, val)
+		}
+	}
+	if eventContext != nil {
+		if ua, ok := headers["user-agent"]; ok && ua == eventContext.GetS("userAgent") {
+			delete(headers, "user-agent")
+		}
+		if page, ok := eventContext.GetN("page").(types.Json); ok {
+			if ref, ok := headers["referer"]; ok && ref == page.GetS("referrer") {
+				delete(headers, "referer")
+			}
+			if host, ok := headers["host"]; ok && host == page.GetS("host") {
+				delete(headers, "host")
+			}
+		}
+	}
+	return headers
 }
 
 func ipStripLastOctet(ip string) string {
@@ -535,7 +676,7 @@ func (r *Router) processSyncDestination(message *IngestMessage, stream *StreamWi
 		for deploymentID, destinations := range byDeployment {
 			fsURL := strings.Replace(r.config.FunctionsServerURLTemplate, "${workspaceId}", deploymentID, 1)
 			endpointURL := fsURL + "/multi"
-			r.callFunctionsEndpoint(stream, destinations, endpointURL, messageBytes, functionsResults, false)
+			r.callFunctionsEndpoint(stream, destinations, endpointURL, messageBytes, functionsResults, false, message.MessageId, parseReceivedAt(message.MessageCreated))
 		}
 	}
 
@@ -595,7 +736,7 @@ type ConnectionChainResult struct {
 
 // callFunctionsEndpoint sends a request to functions endpoint and expects new format with execLog
 // Response format: map[connectionId]{ events: [], execLog: [] }
-func (r *Router) callFunctionsEndpoint(stream *StreamWithDestinations, destinations []*ShortDestinationConfig, baseURL string, messageBytes []byte, functionsResults map[string]any, fullEvents bool) (result map[string]ConnectionChainResult, err error) {
+func (r *Router) callFunctionsEndpoint(stream *StreamWithDestinations, destinations []*ShortDestinationConfig, baseURL string, messageBytes []byte, functionsResults map[string]any, fullEvents bool, messageId string, receivedAt time.Time) (result map[string]ConnectionChainResult, err error) {
 	if len(destinations) == 0 {
 		return
 	}
@@ -606,10 +747,12 @@ func (r *Router) callFunctionsEndpoint(stream *StreamWithDestinations, destinati
 			obj := map[string]any{"error": err.Error()}
 			for _, id := range ids {
 				r.eventsLogService.PostAsync(&eventslog.ActorEvent{
-					EventType: eventslog.EventTypeFunction,
-					Level:     eventslog.LevelError,
-					ActorId:   id,
-					Event:     obj,
+					EventType:   eventslog.EventTypeFunction,
+					Level:       eventslog.LevelError,
+					ActorId:     id,
+					WorkspaceId: stream.Stream.WorkspaceId,
+					MessageId:   messageId,
+					Event:       obj,
 				})
 				DeviceFunctions(id, "error").Inc()
 				DeviceFunctions("total", "error").Inc()
@@ -668,13 +811,14 @@ func (r *Router) callFunctionsEndpoint(stream *StreamWithDestinations, destinati
 	// Process results - extract events and process execLog + logs
 	for connectionId, chainResult := range result {
 		functionsResults[connectionId] = chainResult.Events
-		r.processExecLog(connectionId, chainResult.ExecLog, chainResult.Logs)
+		r.processExecLog(connectionId, stream.Stream.WorkspaceId, messageId, chainResult.ExecLog, chainResult.Logs)
 	}
+	r.emitSyncMetrics(stream, destinations, result, messageId, receivedAt)
 	return result, nil
 }
 
 // processExecLog processes the execution log and function logs from functions server
-func (r *Router) processExecLog(connectionId string, execLog []FunctionExecLogEntry, logs []FunctionLogEntry) {
+func (r *Router) processExecLog(connectionId, workspaceId, messageId string, execLog []FunctionExecLogEntry, logs []FunctionLogEntry) {
 	// Process execution log entries (errors and dropped events)
 	for _, el := range execLog {
 		if el.Error != nil {
@@ -689,10 +833,12 @@ func (r *Router) processExecLog(connectionId string, execLog []FunctionExecLogEn
 				"ms":           el.Ms,
 			}
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{
-				EventType: eventslog.EventTypeFunction,
-				Level:     eventslog.LevelError,
-				ActorId:   connectionId,
-				Event:     logEvent,
+				EventType:   eventslog.EventTypeFunction,
+				Level:       eventslog.LevelError,
+				ActorId:     connectionId,
+				WorkspaceId: workspaceId,
+				MessageId:   messageId,
+				Event:       logEvent,
 			})
 		}
 		if el.Dropped {
@@ -731,16 +877,184 @@ func (r *Router) processExecLog(connectionId string, execLog []FunctionExecLogEn
 			logEvent["args"] = logEntry.Args
 		}
 		r.eventsLogService.PostAsync(&eventslog.ActorEvent{
-			EventType: eventslog.EventTypeFunction,
-			Level:     level,
-			ActorId:   connectionId,
-			Event:     logEvent,
+			EventType:   eventslog.EventTypeFunction,
+			Level:       level,
+			ActorId:     connectionId,
+			WorkspaceId: workspaceId,
+			MessageId:   messageId,
+			Event:       logEvent,
 		})
 	}
 }
 
+// connMetricMessage is one row of the `metrics` table (connection metrics →
+// mv_metrics → console reports). Field names map directly to the ClickHouse columns.
+type connMetricMessage struct {
+	Timestamp     string `json:"timestamp"`
+	MessageId     string `json:"messageId"`
+	WorkspaceId   string `json:"workspaceId"`
+	StreamId      string `json:"streamId"`
+	ConnectionId  string `json:"connectionId"`
+	FunctionId    string `json:"functionId"`
+	DestinationId string `json:"destinationId"`
+	Status        string `json:"status"`
+	Events        int64  `json:"events"`
+	EventIndex    int    `json:"eventIndex"`
+}
+
+// activeIncomingMessage is one row of the `active_incoming` table (billing). The
+// MessageId carries the composed key `messageId_eventIndex_secondOfHour`, deduplicated
+// downstream via uniqState(messageId).
+type activeIncomingMessage struct {
+	Timestamp   string `json:"timestamp"`
+	WorkspaceId string `json:"workspaceId"`
+	MessageId   string `json:"messageId"`
+}
+
+// parseReceivedAt parses an event receivedAt/MessageCreated ISO string, falling back to
+// the current time when it is missing or unparseable.
+func parseReceivedAt(s string) time.Time {
+	if s != "" {
+		if t, err := timestamp.ParseISOFormat(s); err == nil {
+			return t.UTC()
+		}
+	}
+	return timestamp.Now().UTC()
+}
+
+// emitSyncMetrics produces billing (active_incoming) and connection (metrics) metrics for
+// events processed by the synchronous function-server paths (/api/funcs/:conId and
+// processSyncDestination). In the async pipeline these are emitted downstream — bulkerapp
+// consumers call SendMetrics after warehouse delivery (connection metrics) and rotor writes
+// billing — but the sync paths have no such post-delivery hook, so without this the events
+// are invisible to both billing and the console connection reports.
+//
+// Produced to the same Kafka batch topics as SendMetrics, owned by the special "metrics"
+// bulker destination and consumed into ClickHouse by bulkerapp. The ingest service has no
+// Destination repository, so the topic ids are built directly; "metrics"/"active_incoming"
+// are valid topic names, so this matches MakeTopicId's plain ".t." form (see
+// bulkerapp/app/topic_manager.go). Same single-JSON-object-per-row shape and plain status
+// vocabulary (success/error/dropped) as SendMetrics.
+//
+//   - metrics:         one row per (connection, event); status rolled up from the chain
+//     result (error > dropped > success).
+//   - active_incoming: one row per (workspace, messageId, eventIndex) for non-dropped
+//     events, keyed identically to the async path so uniqState(messageId) de-duplicates —
+//     no double counting when processSyncDestination's parent already billed the incoming
+//     event via sendToRotor for an async destination.
+func (r *Router) emitSyncMetrics(stream *StreamWithDestinations, destinations []*ShortDestinationConfig, result map[string]ConnectionChainResult, messageId string, receivedAt time.Time) {
+	if r.config.MetricsDestinationId == "" || len(result) == 0 {
+		return
+	}
+	metricsTopic := fmt.Sprintf("%sin.id.%s.m.batch.t.metrics", r.config.KafkaTopicPrefix, r.config.MetricsDestinationId)
+	billingTopic := fmt.Sprintf("%sin.id.%s.m.batch.t.active_incoming", r.config.KafkaTopicPrefix, r.config.MetricsDestinationId)
+
+	connMsgs, billingMsgs := buildSyncMetrics(stream.Stream.WorkspaceId, stream.Stream.Id, destinations, result, messageId, receivedAt)
+	for i := range connMsgs {
+		if cm, err := jsoniter.Marshal(&connMsgs[i]); err == nil {
+			if perr := r.producer.ProduceAsync(metricsTopic, uuid.New(), cm, nil, kafka.PartitionAny, messageId, false, 0); perr != nil {
+				r.Errorf("Error producing connection metrics to %s: %v", metricsTopic, perr)
+			}
+		}
+	}
+	for i := range billingMsgs {
+		if bm, err := jsoniter.Marshal(&billingMsgs[i]); err == nil {
+			if perr := r.producer.ProduceAsync(billingTopic, billingMsgs[i].MessageId, bm, nil, kafka.PartitionAny, messageId, false, 0); perr != nil {
+				r.Errorf("Error producing billing metrics to %s: %v", billingTopic, perr)
+			}
+		}
+	}
+}
+
+// buildSyncMetrics turns the per-connection chain results into the `metrics` and
+// `active_incoming` rows to emit. It is a pure function (no I/O) so it can be unit tested.
+//
+//   - One connMetricMessage per (connection, eventIndex); status is rolled up from the
+//     per-function exec log with precedence error > dropped > success.
+//   - One activeIncomingMessage per non-dropped (connection, eventIndex). The composed key
+//     `messageId_eventIndex_secondOfHour` matches the async path exactly, so
+//     uniqState(messageId) downstream de-duplicates across paths and destinations.
+func buildSyncMetrics(workspaceId, streamId string, destinations []*ShortDestinationConfig, result map[string]ConnectionChainResult, messageId string, receivedAt time.Time) ([]connMetricMessage, []activeIncomingMessage) {
+	destById := make(map[string]*ShortDestinationConfig, len(destinations))
+	for _, d := range destinations {
+		destById[d.ConnectionId] = d
+	}
+	epoch := receivedAt.Unix()
+	hourTrunc := epoch - epoch%3600
+	tsISO := timestamp.ToISOFormat(receivedAt.UTC())
+	hourISO := timestamp.ToISOFormat(time.Unix(hourTrunc, 0).UTC())
+
+	var connMsgs []connMetricMessage
+	var billingMsgs []activeIncomingMessage
+	for connectionId, chainResult := range result {
+		destinationId := connectionId
+		functionId := "builtin.destination.tag"
+		if d := destById[connectionId]; d != nil {
+			destinationId = d.Id
+			functionId = "builtin.destination." + d.DestinationType
+		}
+
+		// Roll the per-function exec log up to a single status per event index.
+		statuses := make(map[int]string)
+		order := make([]int, 0)
+		for _, el := range chainResult.ExecLog {
+			cur, seen := statuses[el.EventIndex]
+			if !seen {
+				order = append(order, el.EventIndex)
+				cur = "success"
+			}
+			// "dropped" is the terminal disposition — the event did not reach delivery —
+			// so it overrides "error" (an event that errored *and* was dropped never
+			// delivered and must not be billed). "error" overrides "success".
+			switch {
+			case el.Dropped:
+				cur = "dropped"
+			case el.Error != nil && cur != "dropped":
+				cur = "error"
+			}
+			statuses[el.EventIndex] = cur
+		}
+		// Empty exec log (e.g. no functions ran) — still count the incoming event once.
+		if len(order) == 0 {
+			order = append(order, 0)
+			statuses[0] = "success"
+		}
+
+		for _, eventIndex := range order {
+			status := statuses[eventIndex]
+			connMsgs = append(connMsgs, connMetricMessage{
+				Timestamp:     tsISO,
+				MessageId:     messageId,
+				WorkspaceId:   workspaceId,
+				StreamId:      streamId,
+				ConnectionId:  connectionId,
+				FunctionId:    functionId,
+				DestinationId: destinationId,
+				Status:        status,
+				Events:        1,
+				EventIndex:    eventIndex,
+			})
+			// Billing counts active incoming events: everything whose terminal
+			// disposition is not "dropped". A pure error (delivered but failed) is billed,
+			// mirroring the async rule, which bills builtin.destination.* entries that are
+			// non-dropped (a destination that errors keeps status "error" and is billed).
+			// An event that was dropped — including one dropped as the result of an error —
+			// never reached delivery and is not billed.
+			if status == "dropped" {
+				continue
+			}
+			billingMsgs = append(billingMsgs, activeIncomingMessage{
+				Timestamp:   hourISO,
+				WorkspaceId: workspaceId,
+				MessageId:   fmt.Sprintf("%s_%d_%d", messageId, eventIndex, epoch-hourTrunc),
+			})
+		}
+	}
+	return connMsgs, billingMsgs
+}
+
 func (r *Router) buildIngestMessage(c *gin.Context, messageId string, event types.Json, analyticContext types.Json, tp string, loc StreamCredentials, stream *StreamWithDestinations, patchFunc eventPatchFunc, defaultEventName string) (ingestMessage *IngestMessage, ingestMessageBytes []byte, err error) {
-	err = patchFunc(c, messageId, event, tp, loc.IngestType, analyticContext, defaultEventName)
+	err = patchFunc(c, messageId, event, tp, loc.IngestType, analyticContext, defaultEventName, stream)
 	headers := utils.MapMap(utils.MapFilter(c.Request.Header, func(k string, v []string) bool {
 		return len(v) > 0 && !isInternalHeader(k)
 	}), func(k string, v []string) string {

@@ -6,6 +6,9 @@ import { loadPackageJson } from "./shared";
 import cuid from "cuid";
 import { b, green, red } from "../lib/chalk-code-highlight";
 import { getFunctionFromFilePath } from "../lib/compiled-function";
+import { loadProjectConfig } from "../lib/project-config";
+import { readDefaultWorkspace } from "../lib/auth-file";
+import { jitsuClientId } from "../lib/version";
 
 function readLoginFile() {
   const configFile = `${homedir()}/.jitsu/jitsu-cli.json`;
@@ -47,6 +50,7 @@ export async function deploy({ dir, workspace, name: names, ...params }: Args) {
     method: "GET",
     headers: {
       Authorization: `Bearer ${apikey}`,
+      "X-Jitsu-Client": jitsuClientId,
     },
   });
   if (!res.ok) {
@@ -55,34 +59,57 @@ export async function deploy({ dir, workspace, name: names, ...params }: Args) {
   }
   const workspaces = (await res.json()) as any[];
 
-  let workspaceId = workspace;
-  if (!workspace) {
-    if (workspaces.length === 0) {
-      console.error(`${red("No workspaces found")}`);
+  // Which workspace to deploy to. Precedence:
+  //   -w/--workspace flag  →  project config (jitsu.json / package.json "jitsu")
+  //   →  default workspace in ~/.jitsu/jitsu-cli.json  →  interactive prompt.
+  // The reference may be an id or a slug — both are matched against the list.
+  const findWorkspace = (ref?: string) => (ref ? workspaces.find(w => w.id === ref || w.slug === ref) : undefined);
+  const projectConfig = loadProjectConfig(projectDir, packageJson);
+
+  let workspaceObj: Workspace | undefined;
+  if (workspace) {
+    // Explicit -w/--workspace expresses clear intent: fail hard if it doesn't resolve.
+    workspaceObj = findWorkspace(workspace);
+    if (!workspaceObj) {
+      console.error(red(`Workspace '${b(workspace)}' not found (or you don't have access)`));
       process.exit(1);
-    } else if (workspaces.length === 1) {
-      workspaceId = workspaces[0].id;
-    } else {
-      workspaceId = (
-        await inquirer.prompt([
-          {
-            type: "list",
-            name: "workspaceId",
-            message: `Select workspace:`,
-            choices: workspaces.map(w => ({
-              name: `${w.name} (${w.id})`,
-              value: w.id,
-            })),
-          },
-        ])
-      ).workspaceId;
+    }
+  } else {
+    // "Soft" default from project config or ~/.jitsu. If it doesn't resolve (stale,
+    // deleted, wrong account), fall back to auto-select / interactive prompt instead
+    // of hard-failing — preserving the pre-config behavior of `deploy` with no -w.
+    const softRef = projectConfig.workspace ?? readDefaultWorkspace();
+    workspaceObj = findWorkspace(softRef);
+    if (!workspaceObj) {
+      if (softRef) {
+        console.warn(`Configured workspace ${b(softRef)} not found or not accessible. Selecting manually.`);
+      }
+      if (workspaces.length === 0) {
+        console.error(`${red("No workspaces found")}`);
+        process.exit(1);
+      } else if (workspaces.length === 1) {
+        workspaceObj = workspaces[0];
+      } else {
+        const workspaceId = (
+          await inquirer.prompt([
+            {
+              type: "list",
+              name: "workspaceId",
+              message: `Select workspace:`,
+              choices: workspaces.map(w => ({
+                name: `${w.name} (${w.id})`,
+                value: w.id,
+              })),
+            },
+          ])
+        ).workspaceId;
+        workspaceObj = findWorkspace(workspaceId);
+      }
     }
   }
 
-  const workspaceObj = workspaces.find(w => w.id === workspaceId);
-  const workspaceName = workspaceObj?.name;
-  if (!workspaceId || !workspaceName) {
-    console.error(red(`Workspace with id ${workspaceId} not found`));
+  if (!workspaceObj?.id || !workspaceObj?.name) {
+    console.error(red(`Workspace not found`));
     process.exit(1);
   }
   await deployFunctions({ ...params, host, apikey, name: names }, projectDir, packageJson, workspaceObj, "function");
@@ -136,6 +163,7 @@ async function deployFunctions(
       method: "GET",
       headers: {
         Authorization: `Bearer ${apikey}`,
+        "X-Jitsu-Client": jitsuClientId,
       },
     });
     if (!res.ok) {
@@ -188,7 +216,7 @@ async function fetchExistingFunctions({
   workspaceId?: string;
 }): Promise<ExistingFunctionsCache> {
   const res = await fetch(`${host}/api/${workspaceId}/config/function`, {
-    headers: { Authorization: `Bearer ${apikey}` },
+    headers: { Authorization: `Bearer ${apikey}`, "X-Jitsu-Client": jitsuClientId },
   });
   if (!res.ok) {
     console.error(red(`Cannot list existing functions:\n${b(await res.text())}`));
@@ -278,6 +306,7 @@ async function deployFunction(
       method: "POST",
       headers: {
         Authorization: `Bearer ${apikey}`,
+        "X-Jitsu-Client": jitsuClientId,
       },
       body: JSON.stringify({
         id,
@@ -310,6 +339,7 @@ async function deployFunction(
       method: "PUT",
       headers: {
         Authorization: `Bearer ${apikey}`,
+        "X-Jitsu-Client": jitsuClientId,
       },
       body: JSON.stringify({
         id: id,

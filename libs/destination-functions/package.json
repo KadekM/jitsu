@@ -28,17 +28,19 @@
     "@types/node": "catalog:",
     "@vitest/ui": "catalog:",
     "json5": "^2.1.0",
-    "vitest": "catalog:"
+    "msw": "^2.15.0",
+    "vitest": "catalog:",
+    "vite": "^6.4.3"
   },
   "dependencies": {
     "@jitsu/core-functions-lib": "workspace:*",
     "@amplitude/ua-parser-js": "^0.7.33",
     "@hubspot/api-client": "^11.1.0",
-    "undici": "^7.21.0",
+    "undici": "^7.29.0",
     "juava": "workspace:*",
     "node-cache": "^5.1.2",
     "lodash": "catalog:",
-    "posthog-node": "^4.2.1",
+    "posthog-node": "^5.44.0",
     "tslib": "catalog:",
     "zod": "^3.23.8"
   }

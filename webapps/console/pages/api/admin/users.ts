@@ -1,3 +1,7 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument --
+ * Pre-existing implicit-`any` debt, exempted when the unsafe-any gate was
+ * introduced for pages/api/admin (JITSU-158 action item 3). Fix the `any`
+ * flows in this file, then remove this header - do not add new ones. */
 import { getUser } from "../../../lib/api";
 import { z } from "zod";
 import { assertDefined, assertTrue, getErrorMessage, requireDefined } from "juava";
@@ -6,6 +10,8 @@ import { db } from "../../../lib/server/db";
 import { SessionUser } from "../../../lib/schema";
 import { NextApiRequest, NextApiResponse } from "next";
 import { getServerLog } from "../../../lib/server/log";
+
+const log = getServerLog("api/admin/users");
 
 const ResultUser = z.object({
   internalId: z.string().optional(),
@@ -77,6 +83,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     res.status(200).send({ users });
   } catch (e) {
     res.status(500).send(getErrorMessage(e));
-    getServerLog().atError().withCause(e).log("Error obtaining list of platform users");
+    log.atError().withCause(e).log("Error obtaining list of platform users");
   }
 }

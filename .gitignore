@@ -1,6 +1,9 @@
+.DS_Store
 node_modules
 **/node_modules
 .idea
+.vscode
+.kube
 .env.local
 .turbo
 .pnpm-debug.log
@@ -35,3 +38,5 @@ libs/jsondiffpatch/lib/
 **/tsconfig.tsbuildinfo
 /services/functions-server/data/
 /services/functions-server/dist/
+/helm-deps/values-custom.yaml
+/docs/

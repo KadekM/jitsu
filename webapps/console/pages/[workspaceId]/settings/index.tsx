@@ -1,11 +1,12 @@
 import { WorkspacePageLayout } from "../../../components/PageLayout/WorkspacePageLayout";
-import { Alert, Button, Input, Popover, Select, Spin, Tooltip } from "antd";
+import { Alert, Button, Input, Popover, Select, Spin, Switch, Tooltip } from "antd";
 import { useAppConfig, useUser, useWorkspace, useWorkspaceRole } from "../../../lib/context";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { confirmOp, confirmOpWithInput, feedbackError, feedbackSuccess } from "../../../lib/ui";
 import { get } from "../../../lib/useApi";
+import { getWorkspaceCacheKey } from "../../../lib/store";
 import { SafeUserProfile, UserWorkspaceRelation } from "../../../lib/schema";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AsyncButton } from "../../../components/AsyncButton/AsyncButton";
 import { CopyButton } from "../../../components/CopyButton/CopyButton";
 import { WorkspaceNameAndSlugEditor } from "../../../components/WorkspaceNameAndSlugEditor/WorkspaceNameAndSlugEditor";
@@ -487,6 +488,79 @@ const OidcProviders: React.FC<any> = () => {
   );
 };
 
+const DataCollectionSettings: React.FC<any> = () => {
+  const workspace = useWorkspace();
+  const userRole = useWorkspaceRole();
+  const queryClient = useQueryClient();
+  const serverCaptureHeaders = (workspace.featuresEnabled ?? []).includes("captureHeaders");
+  const [captureHeaders, setCaptureHeaders] = useState(serverCaptureHeaders);
+  const [saving, setSaving] = useState(false);
+
+  // Re-sync if the underlying workspace changes (workspace switch, or the cache
+  // patch below propagating through the context). Keyed by the derived boolean,
+  // not the array — the provider spreads the workspace object on every render,
+  // so the array has a fresh identity each time.
+  useEffect(() => {
+    setCaptureHeaders(serverCaptureHeaders);
+  }, [workspace.id, serverCaptureHeaders]);
+
+  const onToggle = async (checked: boolean) => {
+    setSaving(true);
+    try {
+      const updated = await get(`/api/workspace/${workspace.id}`, {
+        method: "PUT",
+        body: { name: workspace.name, slug: workspace.slug, captureHeaders: checked },
+      });
+      // The workspace object lives in a staleTime:Infinity react-query cache
+      // (StoreLoader.initialDataLoad) that nothing refetches on navigation —
+      // without patching it, leaving and re-opening this page resurrects the
+      // pre-toggle value. The cache is keyed by whatever id/slug was in the URL
+      // at load time, so patch both.
+      for (const key of [workspace.id, workspace.slug]) {
+        if (key && queryClient.getQueryData(getWorkspaceCacheKey(key))) {
+          queryClient.setQueryData(getWorkspaceCacheKey(key), (old: any) => ({
+            ...old,
+            featuresEnabled: updated.featuresEnabled,
+          }));
+        }
+      }
+      setCaptureHeaders(checked);
+      feedbackSuccess(
+        `HTTP headers capture ${
+          checked ? "enabled" : "disabled"
+        }. The change applies to new incoming events within a few minutes.`
+      );
+    } catch (e) {
+      feedbackError("Failed to update the setting", { error: e });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-backgroundLight border border-textDisabled rounded-lg overflow-hidden">
+      <div className="px-6 py-4 bg-background border-b border-textDisabled">
+        <h3 className="text-lg font-semibold text-textDark">Data Collection</h3>
+      </div>
+      <div className="flex items-start justify-between px-6 py-5">
+        <div className="flex-1 pr-8">
+          <h4 className="text-base font-semibold text-textDark mb-1">
+            Capture HTTP headers (AI agents and bots detection)
+          </h4>
+          <p className="text-sm font-normal text-text">
+            Store HTTP request headers of incoming events in <code>context.headers</code>. Useful for identifying
+            traffic coming from <b>AI agents and bots</b>. Only the names of sensitive headers (e.g. <code>cookie</code>
+            , <code>authorization</code>) are kept — their values are masked.
+          </p>
+        </div>
+        <Tooltip title={!userRole.editEntities ? "You don't have permission to change this setting" : undefined}>
+          <Switch checked={captureHeaders} loading={saving} disabled={!userRole.editEntities} onChange={onToggle} />
+        </Tooltip>
+      </div>
+    </div>
+  );
+};
+
 const WorkspaceSettingsComponent: React.FC<any> = () => {
   const config = useAppConfig();
   const workspace = useWorkspace();
@@ -572,6 +646,9 @@ const WorkspaceSettingsComponent: React.FC<any> = () => {
           />
         </div>
 
+        {/* Data Collection Section */}
+        <DataCollectionSettings />
+
         {/* OIDC Providers Section */}
         <OidcProviders />
 
@@ -606,7 +683,7 @@ const WorkspaceSettingsComponent: React.FC<any> = () => {
 
 const WorkspaceSettings: React.FC<any> = () => {
   return (
-    <WorkspacePageLayout doNotBlockIfUsageExceeded={true}>
+    <WorkspacePageLayout doNotBlockWithBillingModals={true}>
       <WorkspaceSettingsComponent />
     </WorkspacePageLayout>
   );

@@ -86,7 +86,7 @@ func (r *Router) ClassicHandler(c *gin.Context) {
 	defer func() {
 		IngestedMessagesReceived(metricsId, "received").Inc()
 		if rError != nil {
-			IngestHandlerRequests(domain, "error", rError.ErrorType).Inc()
+			IngestHandlerRequests(metricsId, "error", rError.ErrorType).Inc()
 			IngestedMessagesReceived(metricsId, "errors").Inc()
 		}
 	}()
@@ -186,7 +186,7 @@ func (r *Router) ClassicHandler(c *gin.Context) {
 		if rError != nil && rError.ErrorType != ErrNoDst {
 			obj := map[string]any{"body": string(ingestMessageBytes), "error": rError.PublicError.Error(), "status": utils.Ternary(rError.ErrorType == ErrThrottledType, "SKIPPED", "FAILED")}
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{EventType: eventslog.EventTypeIncoming, Level: eventslog.LevelError, ActorId: metricsId, Event: obj})
-			IngestHandlerRequests(domain, utils.Ternary(rError.ErrorType == ErrThrottledType, "throttled", "error"), rError.ErrorType).Inc()
+			IngestHandlerRequests(metricsId, utils.Ternary(rError.ErrorType == ErrThrottledType, "throttled", "error"), rError.ErrorType).Inc()
 			_ = r.producer.ProduceAsync(r.config.KafkaDestinationsDeadLetterTopicName, uuid.New(), utils.TruncateBytes(ingestMessageBytes, r.config.MaxIngestPayloadSize), map[string]string{"error": rError.Error.Error()}, kafka2.PartitionAny, messageId, false, 0)
 		} else {
 			obj := map[string]any{"body": string(ingestMessageBytes), "asyncDestinations": asyncDestinations}
@@ -197,14 +197,20 @@ func (r *Router) ClassicHandler(c *gin.Context) {
 				obj["error"] = ErrNoDst
 			}
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{EventType: eventslog.EventTypeIncoming, Level: eventslog.LevelInfo, ActorId: metricsId, Event: obj})
-			IngestHandlerRequests(domain, "success", "").Inc()
+			IngestHandlerRequests(metricsId, "success", "").Inc()
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	// sendToRotor / ResponseError may already have written a response (e.g. the
+	// silent quota-block success, or a producer error). gin appends body writes
+	// rather than guarding them, so only write the default success when nothing
+	// has been written yet.
+	if !c.Writer.Written() {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	}
 	return
 }
 
-func patchClassicEvent(c *gin.Context, messageId string, ev types.Json, _ string, ingestType IngestType, _ types.Json, _ string) error {
+func patchClassicEvent(c *gin.Context, messageId string, ev types.Json, _ string, ingestType IngestType, _ types.Json, _ string, _ *StreamWithDestinations) error {
 	ip := strings.TrimSpace(strings.Split(utils.NvlString(c.GetHeader("X-Real-Ip"), c.GetHeader("X-Forwarded-For"), c.ClientIP()), ",")[0])
 	ipPolicy := c.Query(IPPolicyParameter)
 	switch ipPolicy {
@@ -226,6 +232,10 @@ func patchClassicEvent(c *gin.Context, messageId string, ev types.Json, _ string
 		// remove any jitsu special properties from ingested events
 		// it is only allowed to be set via functions
 		types.FilterEvent(ev)
+	} else {
+		// s2s callers may use __sql_type* hints, but hint values reach SQL DDL —
+		// keep only type-shaped ones
+		types.SanitizeSqlTypes(ev)
 	}
 	nowIsoDate := time.Now().UTC().Format(timestamp.JsonISO)
 	ev.Set("_timestamp", nowIsoDate)

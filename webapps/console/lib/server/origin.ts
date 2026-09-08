@@ -1,7 +1,104 @@
 import { NextApiRequest } from "next";
+import { getServerEnv } from "./serverEnv";
 
 export function getRequestHost(req: NextApiRequest) {
   return (req.headers["x-forwarded-host"] || req.headers.host) as string;
+}
+
+/**
+ * Returns the public origin (scheme + host, no trailing slash) at which this
+ * console instance is reachable from the outside world. Used for OAuth issuer
+ * URLs, email links, MCP server metadata — anywhere we need to spell out a
+ * URL that ends up in someone else's hands.
+ *
+ * Resolution order:
+ *   1. `JITSU_PUBLIC_URL` / `JITSU_PUBLIC` — the canonical setting in our
+ *      deployments; dev-scripts/run-app.ts sets this to the portless host
+ *      (e.g. https://console-feat.jitsu.localhost) when JITSU_BRANCH_SUFFIX
+ *      is in use.
+ *   2. `VERCEL_URL` — auto-populated on Vercel previews; needs `https://`
+ *      prefix since Vercel only exports the host.
+ *   3. `NEXTAUTH_URL` — last resort; usually present when NextAuth is wired.
+ *   4. `http://localhost:3000` — local-dev convenience so the function is
+ *      total and callers don't have to handle undefined.
+ */
+export function getPublicOrigin(): string {
+  const env = getServerEnv();
+  const raw =
+    env.JITSU_PUBLIC_URL ||
+    env.JITSU_PUBLIC ||
+    (env.VERCEL_URL ? `https://${env.VERCEL_URL}` : undefined) ||
+    env.NEXTAUTH_URL ||
+    "http://localhost:3000";
+  return raw.replace(/\/+$/, "");
+}
+
+/**
+ * Best-effort client IP for rate limiting.
+ *
+ * Trust model: one reverse proxy (nginx ingress / Vercel edge) that sets
+ * X-Real-IP to its peer's IP and prepends the real client IP to
+ * X-Forwarded-For (stripping any client-supplied value). Under that model
+ * the leftmost XFF entry is the real client IP. Not forgery-proof if a
+ * proxy lets clients inject XFF unmodified, but good enough for rate limiting.
+ */
+export function getClientIp(req: NextApiRequest): string {
+  const realIp = req.headers["x-real-ip"];
+  if (realIp) return Array.isArray(realIp) ? realIp[0] : realIp;
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded).split(",")[0]?.trim();
+    if (first) return first;
+  }
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+export type RequestProvenance = { ip: string | null; headers: Record<string, string> | null };
+
+// Request headers we persist on audit-log rows to help identify the client
+// (SDK/CLI vs browser vs a raw API call) and, secondarily, for humans to
+// inspect. Deliberately excludes anything credential-bearing (authorization,
+// cookie). `x-jitsu-client` is the explicit signal jitsu-cli sends and the one
+// originFromAuth keys on; the rest are for manual inspection.
+const AUDIT_HEADER_ALLOWLIST = [
+  "user-agent",
+  "accept",
+  "content-type",
+  "x-jitsu-client",
+  "referer",
+  "origin",
+  "accept-language",
+] as const;
+
+// `referer` can carry secrets in its query string / fragment — invitation
+// tokens (`/accept?invite=…`), `__unsafe_token=…` URLs, etc. Keep only the
+// scheme+host+path so it stays useful as provenance without persisting those.
+// (`origin` is scheme+host only per spec, so it needs no stripping.)
+function sanitizeHeaderValue(key: string, value: string): string {
+  if (key !== "referer") return value;
+  const cut = value.search(/[?#]/);
+  return cut === -1 ? value : value.slice(0, cut);
+}
+
+/**
+ * Best-effort request provenance for an audit-log row: client IP (via
+ * {@link getClientIp}) plus an allowlisted subset of request headers. Everything
+ * is nullable — a missing `req` (internal callers) or absent headers yield
+ * `null`, which the audit column stores as-is. Never throws.
+ */
+export function extractRequestProvenance(req?: NextApiRequest): RequestProvenance {
+  if (!req) return { ip: null, headers: null };
+  const rawIp = getClientIp(req);
+  const ip = rawIp && rawIp !== "unknown" ? rawIp : null;
+
+  const headers: Record<string, string> = {};
+  for (const key of AUDIT_HEADER_ALLOWLIST) {
+    const v = req.headers[key];
+    if (v == null) continue;
+    const value = Array.isArray(v) ? v.join(", ") : v;
+    if (value) headers[key] = sanitizeHeaderValue(key, value);
+  }
+  return { ip, headers: Object.keys(headers).length > 0 ? headers : null };
 }
 
 export function getTopLevelDomain(requestDomain: string): string {

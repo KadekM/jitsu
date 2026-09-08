@@ -27,6 +27,27 @@ function getPathFromUrl(url: string | undefined): string | undefined {
   }
 }
 
+// A host configured without a scheme (e.g. "us.posthog.com" instead of
+// "https://us.posthog.com") is left untouched by posthog-node, which then builds a
+// schemeless request URL ("us.posthog.com/batch/"). fetch throws on it, posthog wraps
+// that as a PostHogFetchNetworkError - which, unlike an HTTP error, is retried
+// (fetchRetryCount x fetchRetryDelay, ~9s) AND left in the queue, so shutdown()'s drain
+// re-runs it and console.error-spams it. Normalize the host so it always carries a
+// scheme. Any path prefix is preserved (self-hosted posthog can live behind a proxy path).
+function sanitizeHost(host: string | undefined): string {
+  const trimmed = (host ?? "").trim();
+  if (!trimmed) {
+    return POSTHOG_DEFAULT_HOST;
+  }
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    new URL(withScheme);
+  } catch (e) {
+    return POSTHOG_DEFAULT_HOST;
+  }
+  return withScheme.replace(/\/+$/, "");
+}
+
 function getEventProperties(event: AnalyticsServerEvent) {
   //see https://github.com/PostHog/posthog-js-lite/blob/master/posthog-web/src/context.ts
   const analyticsContext = event.context || {};
@@ -85,7 +106,40 @@ const PosthogDestination: JitsuFunction<AnalyticsServerEvent, PosthogDestination
   const sendAnonymousEvents =
     typeof props.sendAnonymousEvents !== "undefined" ? props.sendAnonymousEvents : props.enableAnonymousUserProfiles;
   const groupType = props.groupType || "group";
-  const client = new PostHog(props.key, { host: props.host || POSTHOG_DEFAULT_HOST, fetch: fetch });
+  // posthog-node 5.x treats responses as WHATWG fetch Responses - notably it calls
+  // response.body?.cancel() to discard unread bodies. The functions fetch returns a
+  // node-fetch-style response whose body is a Node Readable (destroy(), no cancel()),
+  // which fails every delivery with "response.body?.cancel is not a function". Adapt
+  // to the surface posthog actually consumes (PostHogFetchResponse: status, headers.get,
+  // text, json) and expose no body, so the optional-chained cancel() no-ops.
+  const posthogFetch = async (url: string, options: any) => {
+    const res = await fetch(url, options);
+    return {
+      status: res.status,
+      headers: { get: (name: string) => res.headers?.get?.(name) ?? null },
+      text: () => res.text(),
+      json: () => res.json(),
+    };
+  };
+  const client = new PostHog(props.key, {
+    host: sanitizeHost(props.host),
+    fetch: posthogFetch,
+    // posthog-node 5.x gzips request bodies by default; these per-event batches
+    // are tiny, and uncompressed bodies keep the functions fetch-debug log readable
+    disableCompression: true,
+    // posthog-node retries failed deliveries 3x with a 3s backoff by default,
+    // blocking the function ~9s per failure (and again on shutdown()'s re-flush).
+    // Jitsu already retries at the rotor level via RetryError, so fail fast here
+    // and defer the retry to that layer instead of blocking in-process.
+    fetchRetryCount: 0,
+  });
+  // capture()/identify()/alias()/groupIdentify() only enqueue - the actual HTTP
+  // delivery happens inside shutdown(), and posthog-node swallows fetch errors
+  // there (they are emitted on the "error" event instead of rejecting the
+  // shutdown promise). Without listening for them, a failed delivery would be
+  // reported as success and the events silently dropped.
+  let deliveryError: any = undefined;
+  client.on("error", e => (deliveryError = deliveryError ?? e));
   try {
     if (event.type === "identify") {
       client.identify({
@@ -161,9 +215,35 @@ const PosthogDestination: JitsuFunction<AnalyticsServerEvent, PosthogDestination
       }
     }
   } catch (e: any) {
-    throw new RetryError(e.message);
+    // synchronous enqueue-time errors; the finally below still flushes the queue
+    throw new RetryError(e?.message || String(e));
   } finally {
-    await client.shutdown();
+    // This is where the queued events are actually sent. Flush explicitly first:
+    // flush() rejects with the delivery error without logging anything, while
+    // shutdown()'s internal flush console.error's every failure with the full
+    // response body ("Error while flushing PostHog: ...") - and that call is
+    // hardwired to console, so no client option can silence it. After flush()
+    // the queue is empty (posthog drops the batch on HTTP errors), leaving
+    // shutdown() nothing to re-send; it still runs to release timers and
+    // pending work.
+    let flushed = false;
+    try {
+      await client.flush();
+      flushed = true;
+    } catch (e) {
+      deliveryError = deliveryError ?? e;
+    }
+    // shutdown()'s internal drain re-flushes any batch still queued and console.error-spams
+    // it - posthog keeps network-errored batches (unlike HTTP errors, which it drops). flush()
+    // above already attempted delivery and never logs, so only shut down when it succeeded;
+    // on failure there is nothing left worth re-draining, and the flush timer is unref'd so
+    // skipping shutdown() leaks nothing.
+    if (flushed) {
+      await client.shutdown().catch(e => (deliveryError = deliveryError ?? e));
+    }
+  }
+  if (deliveryError) {
+    throw new RetryError(deliveryError?.message || String(deliveryError));
   }
 };
 

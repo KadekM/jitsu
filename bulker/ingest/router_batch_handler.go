@@ -175,7 +175,7 @@ func (r *Router) BatchHandler(c *gin.Context) {
 	defer func() {
 		IngestedMessagesReceived(metricsId, "received").Add(float64(metricsBatchSize))
 		if rError != nil {
-			IngestHandlerRequests(domain, "error", rError.ErrorType).Inc()
+			IngestHandlerRequests(metricsId, "error", rError.ErrorType).Inc()
 			IngestedMessagesReceived(metricsId, "errors").Add(float64(metricsBatchSize))
 		}
 	}()
@@ -268,8 +268,8 @@ func (r *Router) BatchHandler(c *gin.Context) {
 	// threading the timestamp through patchEvent's signature or changing
 	// its Set→SetIfAbsent semantics (the latter would let a
 	// client-provided receivedAt survive — FilterEvent doesn't strip it).
-	patch := func(c *gin.Context, messageId string, ev types.Json, tp string, it IngestType, ac types.Json, defName string) error {
-		if err := patchEvent(c, messageId, ev, tp, it, ac, defName); err != nil {
+	patch := func(c *gin.Context, messageId string, ev types.Json, tp string, it IngestType, ac types.Json, defName string, stream *StreamWithDestinations) error {
+		if err := patchEvent(c, messageId, ev, tp, it, ac, defName, stream); err != nil {
 			return err
 		}
 		ev.Set("receivedAt", receivedAtStr)
@@ -311,9 +311,18 @@ func (r *Router) BatchHandler(c *gin.Context) {
 		if rError != nil && rError.ErrorType != ErrNoDst {
 			obj := map[string]any{"body": string(ingestMessageBytes), "error": rError.PublicError.Error(), "status": utils.Ternary(rError.ErrorType == ErrThrottledType, "SKIPPED", "FAILED")}
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{EventType: eventslog.EventTypeIncoming, Level: eventslog.LevelError, ActorId: metricsId, Event: obj})
-			IngestHandlerRequests(domain, utils.Ternary(rError.ErrorType == ErrThrottledType, "throttled", "error"), rError.ErrorType).Inc()
+			IngestHandlerRequests(metricsId, utils.Ternary(rError.ErrorType == ErrThrottledType, "throttled", "error"), rError.ErrorType).Inc()
 			_ = r.producer.ProduceAsync(r.config.KafkaDestinationsDeadLetterTopicName, uuid.New(), utils.TruncateBytes(ingestMessageBytes, r.config.MaxIngestPayloadSize), map[string]string{"error": rError.Error.Error()}, kafka2.PartitionAny, messageId, false, 0)
-			errors = append(errors, fmt.Sprintf("Message ID: %s: %v", messageId, rError.PublicError))
+			if rError.ErrorType == ErrThrottledType && !r.config.ErrorOnThrottle {
+				// Quota block (JITSU-88) is a silent success for the client: the
+				// event is tracked as SKIPPED/throttled above but must not fail
+				// the batch. Count it toward okEvents so the batch response stays
+				// ok=true. With ERROR_ON_THROTTLE the block is a client-visible
+				// error, so it falls through to the errors list below.
+				okEvents++
+			} else {
+				errors = append(errors, fmt.Sprintf("Message ID: %s: %v", messageId, rError.PublicError))
+			}
 		} else {
 			obj := map[string]any{"body": string(ingestMessageBytes), "asyncDestinations": asyncDestinations, "tags": tagsDestinations}
 			if len(asyncDestinations) > 0 || len(tagsDestinations) > 0 {
@@ -325,7 +334,7 @@ func (r *Router) BatchHandler(c *gin.Context) {
 				errors = append(errors, fmt.Sprintf("Message ID: %s: %v", messageId, rError.PublicError))
 			}
 			r.eventsLogService.PostAsync(&eventslog.ActorEvent{EventType: eventslog.EventTypeIncoming, Level: eventslog.LevelInfo, ActorId: metricsId, Event: obj})
-			IngestHandlerRequests(domain, "success", "").Inc()
+			IngestHandlerRequests(metricsId, "success", "").Inc()
 		}
 	}
 	processedEvents := len(batch)

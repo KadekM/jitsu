@@ -1,4 +1,4 @@
-import React, { PropsWithChildren, ReactNode, useEffect, useState } from "react";
+import React, { PropsWithChildren, ReactNode, useEffect, useRef, useState } from "react";
 import { branding } from "../../lib/branding";
 import { HiSelector } from "react-icons/hi";
 import { FaDocker, FaSignOutAlt, FaUserCircle } from "react-icons/fa";
@@ -8,10 +8,11 @@ import { ButtonLabel } from "../ButtonLabel/ButtonLabel";
 import styles from "./WorkspacePageLayout.module.css";
 import {
   Activity,
-  AlertCircle,
-  ArrowRight,
   BellIcon,
+  Building2,
+  Check,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   CreditCard,
   FilePlus,
@@ -20,6 +21,7 @@ import {
   Globe,
   Hammer,
   HelpCircle,
+  Import,
   LayoutDashboard,
   LineChart,
   PackageOpen,
@@ -42,17 +44,16 @@ import { NextRouter, useRouter } from "next/router";
 import Link from "next/link";
 import { getDomains, useAppConfig, useUser, useUserSessionControls, useWorkspace } from "../../lib/context";
 import { useApi } from "../../lib/useApi";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { Overlay } from "../Overlay/Overlay";
 import { WorkspaceNameAndSlugEditor } from "../WorkspaceNameAndSlugEditor/WorkspaceNameAndSlugEditor";
-import { assertDefined, assertTrue, getLog } from "juava";
+import { getLog } from "juava";
 import classNames from "classnames";
-import { BillingBlockingDialog } from "../Billing/BillingBlockingDialog";
+import { BillingBanners } from "../Billing/BillingBanners";
 import { useJitsu } from "@jitsu/jitsu-react";
 import { useSearchParams } from "next/navigation";
 import omit from "lodash/omit";
-import { useBilling, UseBillingResult } from "../Billing/BillingProvider";
-import { useEventsUsage, UseUsageRes } from "../Billing/use-events-usage";
 import { MenuItemType } from "antd/lib/menu/interface";
 import { FaGear } from "react-icons/fa6";
 
@@ -62,17 +63,77 @@ export type PageLayoutProps = {
   onClose?: () => void;
   contentClassName?: string;
   className?: string;
-  doNotBlockIfUsageExceeded?: boolean;
+  /**
+   * Suppress billing blocking modals (e.g. the unpaid-invoices one) on this
+   * page. Set by the pages the user needs to fix billing — workspace settings
+   * and the billing pages — so they always stay reachable.
+   */
+  doNotBlockWithBillingModals?: boolean;
 };
 
 export type WorkspaceSelectorProps = {
   currentTitle: ReactNode;
 };
 
-function WorkspacesMenu(props: { jitsuClassicAvailable: boolean }) {
+type WorkspacesListResponse = {
+  workspaces: { id: string; name: string; slug?: string | null }[];
+  pagination: { totalCount: number; hasMore: boolean };
+};
+
+// The recent-workspaces query URL, shared between the fetch and the post-switch invalidation so the
+// two never drift out of sync.
+const WORKSPACES_LIST_URL = "/api/workspace?page=0&limit=10";
+
+function WorkspacesMenu(props: {
+  jitsuClassicAvailable: boolean;
+  workspacesData?: WorkspacesListResponse;
+  workspacesLoading: boolean;
+}) {
   const router = useRouter();
   const appConfig = useAppConfig();
+  const currentWorkspace = useWorkspace();
   const { data, error } = useApi(`/api/user/properties`);
+
+  // Inline workspace switcher. The server selects WHICH workspaces to show by last-used (the top 10),
+  // so the list is your most-relevant workspaces — but we render them ALPHABETICALLY, so the on-screen
+  // order is stable and never reshuffles when recency changes. "More" links to the full `/workspaces`
+  // page. Data is preloaded by WorkspaceSelector and passed in here, so the dropdown paints instantly.
+  const { workspacesData, workspacesLoading } = props;
+  const recentWorkspaces = [...(workspacesData?.workspaces ?? [])].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+  );
+  // When the user has more workspaces than we list inline, a single "View all workspaces" action
+  // (with the total) links to the full page. When they all fit, we just show them — no extra link.
+  const totalCount = workspacesData?.pagination?.totalCount ?? 0;
+  const hasMore = totalCount > recentWorkspaces.length;
+
+  const workspaceItems: MenuProps["items"] = [];
+  if (workspacesLoading) {
+    workspaceItems.push({
+      key: "workspaces-loading",
+      disabled: true,
+      label: <span className="text-textDisabled text-sm">Loading workspaces…</span>,
+    });
+  } else {
+    for (const w of recentWorkspaces) {
+      const isCurrent = w.id === currentWorkspace.id;
+      workspaceItems.push({
+        key: `ws-${w.id}`,
+        label: (
+          <Link href={`/${w.slug || w.id}`} className="flex items-center justify-between gap-6">
+            <ButtonLabel iconSize="small" icon={<Building2 className="h-full w-full" />}>
+              {w.name}
+            </ButtonLabel>
+            {isCurrent && <Check className="h-4 w-4 text-primary shrink-0" />}
+          </Link>
+        ),
+      });
+    }
+  }
+  if (workspaceItems.length > 0) {
+    workspaceItems.push({ type: "divider", key: "workspaces-divider" });
+  }
+
   let additionalMenuItems: MenuItemType[] = [];
   if (error) {
     log.atWarn().log("Failed to load user properties", error);
@@ -105,16 +166,25 @@ function WorkspacesMenu(props: { jitsuClassicAvailable: boolean }) {
   return (
     <Menu
       items={[
-        {
-          key: "all-workspaces",
-          label: (
-            <Link href="/workspaces" className="flex items-center">
-              <ButtonLabel iconSize="small" icon={<Folders className="w-full h-full" />}>
-                All Workspaces
-              </ButtonLabel>
-            </Link>
-          ),
-        },
+        ...workspaceItems,
+        ...(hasMore
+          ? [
+              {
+                key: "view-all-workspaces",
+                label: (
+                  <Link href="/workspaces" className="flex items-center justify-between gap-6">
+                    <ButtonLabel iconSize="small" icon={<Folders className="h-full w-full" />}>
+                      View all workspaces
+                    </ButtonLabel>
+                    <span className="flex items-center gap-1 text-textLight text-xs shrink-0">
+                      {totalCount.toLocaleString("en-US")}
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </span>
+                  </Link>
+                ),
+              },
+            ]
+          : []),
         {
           key: "new-workspace",
           label: (
@@ -128,6 +198,20 @@ function WorkspacesMenu(props: { jitsuClassicAvailable: boolean }) {
             await router.push("/new-workspace");
           },
         },
+        ...(appConfig.migrationWizardEnabled
+          ? [
+              {
+                key: "import-setup",
+                label: (
+                  <Link href={`/${currentWorkspace.slugOrId}/import`} className="flex items-center">
+                    <ButtonLabel iconSize="small" icon={<Import className="h-full w-full" />}>
+                      Import setup
+                    </ButtonLabel>
+                  </Link>
+                ),
+              },
+            ]
+          : []),
         ...additionalMenuItems,
       ]}
     />
@@ -136,11 +220,38 @@ function WorkspacesMenu(props: { jitsuClassicAvailable: boolean }) {
 
 export const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = props => {
   const [open, setOpen] = useState(false);
+  const queryClient = useQueryClient();
+  const currentWorkspace = useWorkspace();
+  const firstWorkspaceEffect = useRef(true);
   //const classicProject = useClassicProject();
+
+  // Preload the recent-workspaces list on mount so the switcher paints instantly. Never revalidated
+  // while the dropdown is open (the effect below only fires on a workspace change, when the dropdown
+  // is closed), so the list never moves under the user.
+  const workspaces = useApi<WorkspacesListResponse>(WORKSPACES_LIST_URL);
+
+  // Switching workspaces bumps that workspace's `lastUsed` server-side, which can change WHICH
+  // workspaces fall in the "most recent" set the list is built from. Invalidate on workspace change
+  // so react-query refetches in the background — the dropdown is closed at switch time, so nothing
+  // moves on screen; the fresh set is ready for the next open. Skip the initial mount (the preload
+  // already fetched). Only set membership can change here; display order stays alphabetical.
+  useEffect(() => {
+    if (firstWorkspaceEffect.current) {
+      firstWorkspaceEffect.current = false;
+      return;
+    }
+    queryClient.invalidateQueries({ queryKey: ["GET", WORKSPACES_LIST_URL] });
+  }, [currentWorkspace.id, queryClient]);
 
   return (
     <Dropdown
-      dropdownRender={() => <WorkspacesMenu jitsuClassicAvailable={false} />}
+      dropdownRender={() => (
+        <WorkspacesMenu
+          jitsuClassicAvailable={false}
+          workspacesData={workspaces.data}
+          workspacesLoading={workspaces.isLoading}
+        />
+      )}
       trigger={["click"]}
       open={open}
       onOpenChange={open => setOpen(open)}
@@ -334,111 +445,9 @@ const UserProfileButton: React.FC<{}> = () => {
   );
 };
 
-const AlertView: React.FC<PropsWithChildren<{}>> = ({ children }) => {
-  const [show, setShow] = useState(false);
-  const workspaceAlertHiddenAt = "workspaceAlertHiddenAt";
-  useEffect(() => {
-    const hiddenAt = localStorage.getItem(workspaceAlertHiddenAt);
-    const hideAlertSeconds = 60 * 60; // 1 hour
-    if (!hiddenAt || new Date().getTime() - new Date(hiddenAt).getTime() > 1000 * hideAlertSeconds) {
-      setTimeout(() => setShow(true), 1); // show after 1ms to avoid SSR issues and enable animation
-    }
-  }, []);
-
-  return (
-    <div
-      className="absolute top-0 z-40 rounded-b bg-white transition-all duration-500 ease-in-out"
-      style={{ transform: `translateX(-50%) ` + (show ? "" : "translateY(-100%)"), left: "50%", maxWidth: "40vw" }}
-    >
-      <div
-        className={`rounded-b border-warning border-l border-r border-b flex items-start space-x-4 py-2 px-4 text-xs bg-warning/5 `}
-      >
-        <AlertCircle className="text-warning" />
-        <div>{children}</div>
-        <div>
-          <button
-            onClick={() => {
-              setShow(false);
-              localStorage.setItem(workspaceAlertHiddenAt, new Date().toISOString());
-            }}
-          >
-            <X className="h-3" />
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-function usageIsAboutToExceed(billing: UseBillingResult, usage: UseUsageRes) {
-  return (
-    billing.enabled &&
-    billing.settings &&
-    !usage.isLoading &&
-    !usage.error &&
-    usage.usage?.usagePercentage &&
-    usage.usage?.usagePercentage < 1 &&
-    billing.settings.planId === "free" &&
-    usage.usage?.projectionByTheEndOfPeriod &&
-    usage.usage?.projectionByTheEndOfPeriod > usage.usage.maxAllowedDestinatonEvents
-  );
-}
-
-const FreePlanQuotaAlert: React.FC<{}> = () => {
-  const workspace = useWorkspace();
-  const usage = useEventsUsage({ skipSubscribed: true });
-  const billing = useBilling();
-  const router = useRouter();
-  assertTrue(billing.enabled, "Billing should be enabled and loaded");
-  assertDefined(billing.settings, "Billing settings should be loaded");
-
-  if (router.pathname.endsWith("/settings/billing")) {
-    //don't display second alert on billing page
-    return <></>;
-  }
-
-  if (usage.throttle) {
-    return (
-      <AlertView>
-        Your workspace is throttled due to exceeding the free plan quota at rate of <b>{usage.throttle}%</b>
-        <Link
-          className="group inline-flex items-center border-b border-neutral-600"
-          href={`/${workspace.slugOrId}/settings/billing`}
-        >
-          Go to billing to see more details{" "}
-          <ArrowRight className="h-4 group-hover:rotate-45 transition-all duration-500" />
-        </Link>
-      </AlertView>
-    );
-  } else if (usageIsAboutToExceed(billing, usage)) {
-    return (
-      <AlertView>
-        You are projected to exceed your monthly events. Please upgrade your plan to avoid service disruption.{" "}
-        <Link
-          className="group inline-flex items-center border-b border-neutral-600"
-          href={`/${workspace.slugOrId}/settings/billing`}
-        >
-          Go to billing <ArrowRight className="h-4 group-hover:rotate-45 transition-all duration-500" />
-        </Link>
-      </AlertView>
-    );
-  }
-
-  return <></>;
-};
-
-const WorkspaceAlert: React.FC<{}> = () => {
-  const billing = useBilling();
-  if (billing.loading || !billing.enabled) {
-    return <></>;
-  }
-  return <FreePlanQuotaAlert />;
-};
-
 function PageHeader() {
   const appConfig = useAppConfig();
   const workspace = useWorkspace();
-  const billing = useBilling();
   const items: (TabsMenuItem | TabsMenuGroup | undefined | false)[] = [
     { title: "Overview", path: "/", aliases: "/overview", icon: <LayoutDashboard className="w-full h-full" /> },
     {
@@ -502,9 +511,17 @@ function PageHeader() {
           path: "/settings/audit-log",
           icon: <ShieldAlert className="w-full h-full" />,
         },
-        billing.enabled && billing.settings?.dataRetentionEditorEnabled
+        {
+          title: "Observability Exports",
+          path: "/settings/observability-exports",
+          icon: <ScrollText className="w-full h-full" />,
+        },
+        // Self-serve backup retention (JITSU-202) is available to every Jitsu
+        // Cloud workspace; the page itself shows the legacy retention-policy
+        // editor only when the plan enables it.
+        appConfig.ee?.available
           ? {
-              title: "Data Retention",
+              title: "Data Retention & Backups",
               path: "/settings/data-retention",
               icon: <PackageOpen className="w-full h-full" />,
             }
@@ -527,7 +544,6 @@ function PageHeader() {
   return (
     <div>
       <div className="w-full relative">
-        <WorkspaceAlert />
         <div className="flex justify-between items-center px-4">
           <Breadcrumbs />
           <UserProfileButton />
@@ -620,7 +636,7 @@ export const WorkspacePageLayout: React.FC<PropsWithChildren<PageLayoutProps>> =
   contentClassName,
   onClose,
   children,
-  doNotBlockIfUsageExceeded,
+  doNotBlockWithBillingModals,
 }) => {
   const [showDrawer, setShowDrawer] = useState(false);
   const workspace = useWorkspace();
@@ -666,7 +682,6 @@ export const WorkspacePageLayout: React.FC<PropsWithChildren<PageLayoutProps>> =
 
   return (
     <div className={`flex flex-col ${screen ? "h-screen" : ""} ${className}`}>
-      {!doNotBlockIfUsageExceeded && <BillingBlockingDialog />}
       <div className={`flex-auto ${fullscreen || screen ? "overflow-hidden" : ""} flex flex-col`}>
         {!workspace.slug && (
           <WorkspaceSettingsModal
@@ -706,6 +721,14 @@ export const WorkspacePageLayout: React.FC<PropsWithChildren<PageLayoutProps>> =
         ) : (
           pHeader
         )}
+        {!fullscreen && (
+          <VerticalSection>
+            <WidthControl className={"px-8"}>
+              <BillingBanners suppressModals={doNotBlockWithBillingModals} />
+            </WidthControl>
+          </VerticalSection>
+        )}
+        {fullscreen && <BillingBanners modalsOnly suppressModals={doNotBlockWithBillingModals} />}
         <VerticalSection className={`flex-auto overflow-auto ${fullscreen ? "py-2" : "py-12"} ${contentClassName}`}>
           {fullscreen && (
             <button

@@ -56,7 +56,20 @@ type Config struct {
 
 	MetricsPort int `mapstructure:"METRICS_PORT" default:"9091"`
 
+	// Destination id of the special "metrics" bulker destination that owns the
+	// `metrics` and `active_incoming` Kafka batch topics. The synchronous
+	// function-server paths (/api/funcs/:conId and processSyncDestination) produce
+	// billing + connection metrics to those topics. Empty disables the emission.
+	MetricsDestinationId string `mapstructure:"METRICS_DESTINATION_ID" default:"metrics"`
+
 	MaxIngestPayloadSize int `mapstructure:"MAX_INGEST_PAYLOAD_SIZE" default:"1000000"`
+
+	// When a stream is fully throttled (quota block), reject the event with an
+	// HTTP 402 (default true — the pre-JITSU-88 behavior, visible to the client
+	// and its monitoring). Set false for a silent block: the event is accepted
+	// (HTTP 200) and preserved in backup but not delivered to destinations —
+	// invisible to the client.
+	ErrorOnThrottle bool `mapstructure:"ERROR_ON_THROTTLE" default:"true"`
 
 	WeightedPartitionSelectorLagThreshold int64 `mapstructure:"WEIGHTED_PARTITION_SELECTOR_LAG_THRESHOLD" default:"0"`
 	// # GRACEFUL SHUTDOWN

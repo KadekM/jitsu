@@ -23,10 +23,11 @@ export type ConfigApi<T = any> = {
 };
 
 export type EventsLogApi = {
+  /** `actorId` omitted → events of all the actors of the workspace, each record carries `actorId` */
   get(
     eventType: string,
     levels: ("warn" | "info" | "error" | "debug")[] | "all",
-    actorId: string,
+    actorId: string | undefined,
     filter: EventsLogFilter,
     limit: number,
     search?: string
@@ -43,13 +44,13 @@ export function getEventsLogApi(workspaceId: string): EventsLogApi {
     get(
       eventType: string,
       levels: ("warn" | "info" | "error" | "debug")[] | "all",
-      actorId: string,
+      actorId: string | undefined,
       filter: EventsLogFilter,
       limit: number,
       search?: string
     ): Promise<EventsLogRecord[]> {
       return rpc(
-        `/api/${workspaceId}/log/${eventType}/${actorId}?limit=${limit}${
+        `/api/${workspaceId}/log/${eventType}${actorId ? `/${actorId}` : ""}?limit=${limit}${
           filter.start ? "&start=" + filter.start.toISOString() : ""
         }${filter.end ? "&end=" + filter.end.toISOString() : ""}${
           levels !== "all" ? `&levels=${levels.join(",")}` : ""
@@ -154,6 +155,10 @@ type UseApiOpts<Req, Res, Query> = {
   queryType?: ZodType<Query>;
   method?: string;
   mockResponse?: Res;
+  // Re-fetch the resource on this interval (ms). Useful for endpoints whose
+  // value can change underneath the app without user interaction — e.g.
+  // `/api/app-config` (maintenance descriptor mounted via ConfigMap).
+  refetchInterval?: number;
 };
 
 export function useApi<Res = any, Req = any, Query extends Record<string, any> = Record<string, any>>(
@@ -187,7 +192,14 @@ export function useApi<Res = any, Req = any, Query extends Record<string, any> =
       }
       return zodParsed.data;
     },
-    { retry: false, cacheTime: 0, staleTime: 0, refetchOnWindowFocus: false, refetchOnMount: false }
+    {
+      retry: false,
+      cacheTime: 0,
+      staleTime: 0,
+      refetchOnWindowFocus: false,
+      refetchOnMount: false,
+      refetchInterval: opts?.refetchInterval,
+    }
   );
   return { ...queryResult, reload: () => setVersion(version + 1) };
 }
